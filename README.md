@@ -53,11 +53,25 @@ tok.special_tokens                      # => {"<|endoftext|>" => 50256}
 ```ruby
 Gigatoken::Tokenizer.from_file("tokenizer.json")
 Gigatoken::Tokenizer.from_hub("openai-community/gpt2", revision: "main")
-Gigatoken::Tokenizer.from_tiktoken("vocab.tiktoken")
+Gigatoken::Tokenizer.from_tiktoken("cl100k_base.tiktoken", pretokenizer: "gpt4", special_tokens: {"<|endoftext|>" => 100257})
 Gigatoken::Tokenizer.from_json(File.binread("tokenizer.json"))
 ```
 
+A `.tiktoken` file holds mergeable ranks only — its pretokenization scheme and special tokens live in the code that defines the encoding, not the file — so `pretokenizer:` is a required keyword (one of `Gigatoken::Native.pretokenizer_names`: `gpt2`/`r50k`, `gpt4`/`cl100k`, `qwen2`, `qwen35`, `olmo3`, `deepseek_v3`, `o200k`, `nemotron`, `kimi`) and `special_tokens:` defaults to none. Nothing is guessed: an unknown scheme raises `Gigatoken::Error` naming the valid ones, and `Tokenizer.load` on a `.tiktoken` path with no `pretokenizer:` raises rather than silently picking one.
+
 SentencePiece-BPE models (Llama, Gemma, Mistral — any `tokenizer.json` with `byte_fallback: true`) load through the same entry points and pick the right backend automatically. One difference: the SentencePiece core decodes text, so it validates input and raises `Gigatoken::Error` on invalid UTF-8 instead of guessing.
+
+### Encode-cache budget
+
+Each tokenizer's pretoken cache is capped process-globally (512 MiB per worker by default) so long-lived processes — a Rails worker, say — don't grow it unbounded; a full cache wipes back toward its seed level and refills, which costs a bit of re-computation but never changes encode output. Tune it before building tokenizers you want the new budget to apply to:
+
+```ruby
+Gigatoken.max_cache_bytes            # => 536870912 (512 MiB)
+Gigatoken.max_cache_bytes = 64 << 20 # only tokenizers built after this see the new budget
+Gigatoken.max_cache_bytes = nil      # unbounded
+
+tok.cache_entries                    # => cached pretoken/unit count right now
+```
 
 ### Tokenize files without leaving Rust
 

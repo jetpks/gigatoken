@@ -42,10 +42,14 @@ pub struct SentencePieceTokenizer {
 }
 
 impl SentencePieceTokenizer {
+    /// Wrap a loaded model, applying the global cache budget to it and to
+    /// the single-document encode state — mirrors pyo3's `with_model`.
     pub(crate) fn from_tokenizer(tokenizer: SentencePieceBPE) -> Self {
+        let tokenizer = crate::cache::apply_max_cache_bytes_sp(tokenizer);
+        let state = EncodeState::with_budget(tokenizer.max_cache_bytes());
         Self {
             tokenizer: RefCell::new(tokenizer),
-            state: RefCell::new(EncodeState::new()),
+            state: RefCell::new(state),
         }
     }
 
@@ -188,6 +192,12 @@ impl SentencePieceTokenizer {
         }
         Ok(result)
     }
+
+    /// Cached unit entries on the single-document `encode` path's state
+    /// (batch encoders are per-call); see `BPETokenizer::cache_entries`.
+    fn cache_entries(&self) -> usize {
+        self.state.borrow().cache_size()
+    }
 }
 
 pub fn init(ruby: &Ruby, native: RModule) -> Result<(), Error> {
@@ -201,5 +211,6 @@ pub fn init(ruby: &Ruby, native: RModule) -> Result<(), Error> {
     class.define_method("vocab_size", method!(SentencePieceTokenizer::vocab_size, 0))?;
     class.define_method("vocab", method!(SentencePieceTokenizer::vocab, 0))?;
     class.define_method("merges", method!(SentencePieceTokenizer::merges, 0))?;
+    class.define_method("cache_entries", method!(SentencePieceTokenizer::cache_entries, 0))?;
     Ok(())
 }

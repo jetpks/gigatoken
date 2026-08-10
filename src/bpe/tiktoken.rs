@@ -48,7 +48,9 @@ pub struct Tokenizer {
     /// Append-only arena of encoded token IDs. Cache entries for encodings
     /// of 5+ tokens store `(offset, len)` slices into this vector; shorter
     /// encodings (well over 99% of hit occurrences) live inline in the
-    /// cache entry and never touch it.
+    /// cache entry and never touch it. A generation wipe (see
+    /// [`Self::set_max_cache_bytes`]) truncates it together with every
+    /// cache entry referencing it.
     token_arena: Vec<TokenId>,
     /// Pretoken cache for the common case (≤ 15 bytes, ~99.9% of
     /// pretokens). The key packs the bytes into the low 15 bytes and the
@@ -88,6 +90,78 @@ pub struct Tokenizer {
     /// would decompose differently (GLM-5.2 has ~97k such words); a plain
     /// merge walk diverges from HF on those.
     ignore_merges: bool,
+    /// Cache memory budget; `None` = unbounded. See
+    /// [`Self::set_max_cache_bytes`].
+    cache_budget: Option<CacheBudget>,
+}
+
+/// Budget split of [`Tokenizer::set_max_cache_bytes`] plus the
+/// per-generation counters — a pure function of budget and seed, so
+/// forks just clone it with the counters reset.
+#[derive(Clone)]
+struct CacheBudget {
+    /// Configured total budget in bytes; forks inherit it verbatim.
+    total_bytes: usize,
+    /// Short-table slot CEILING (power of two): the table grows by
+    /// normal doubling below it; at the ceiling, reaching the 3/4
+    /// growth threshold triggers a generation wipe instead.
+    short_slots: usize,
+    /// Token-arena sub-budget in `TokenId` entries.
+    arena_entries: usize,
+    /// Long-map byte budget (key bytes + [`Self::LONG_ENTRY_BYTES`] each).
+    long_bytes: usize,
+    /// Long-map bytes this generation, maintained at the two long-map
+    /// insert sites; wipes reset it.
+    long_bytes_used: usize,
+    /// Largest single encoding (in tokens) appended to the arena. The
+    /// arena wipe trigger allows this much slack past `arena_entries`,
+    /// so one recurring giant pretoken whose encoding alone exceeds the
+    /// sub-budget cannot force a wipe per occurrence. Kept across wipes
+    /// (it describes the corpus, not the generation).
+    max_encoding: usize,
+    /// Wipes since the budget was set (or since this fork was created).
+    generations: u64,
+}
+
+impl CacheBudget {
+    /// Estimated non-key bytes per long-map entry (hashbrown bucket at
+    /// ~7/8 load + malloc overhead of the boxed key).
+    const LONG_ENTRY_BYTES: usize = 48;
+
+    /// Split `total_bytes` between the three caches given the seed
+    /// footprint (`n_seed` short entries, `seed_arena_len` arena
+    /// entries). Allocates nothing.
+    fn derive(total_bytes: usize, n_seed: usize, seed_arena_len: usize) -> Self {
+        // Ceiling: the largest power of two with slots * 32 <= 70% of
+        // the budget (floor 2^16 slots); the seed requirement can push
+        // it higher.
+        let target = ((total_bytes / 32).saturating_mul(7) / 10).max(1 << 16);
+        let target = if target.is_power_of_two() {
+            target
+        } else {
+            target.next_power_of_two() / 2
+        };
+        let mut short_slots = ShortPretokenCache::required_capacity(n_seed, target);
+        // Headroom floor: keep the seed at <= 5/8 of the ceiling so each
+        // generation admits at least capacity/8 entries before the 3/4
+        // wipe threshold — a seed landing just under the threshold would
+        // otherwise wipe every few misses.
+        while n_seed * 8 > short_slots * 5 {
+            short_slots *= 2;
+        }
+        let rem = total_bytes.saturating_sub(short_slots * 32);
+        // Even arena/long split, floored so degenerate budgets stay
+        // functional (the arena must hold the seed spills with headroom).
+        CacheBudget {
+            total_bytes,
+            short_slots,
+            arena_entries: ((rem / 2) / 4).max(seed_arena_len * 2 + 4096),
+            long_bytes: (rem / 2).max(64 << 10),
+            long_bytes_used: 0,
+            max_encoding: 0,
+            generations: 0,
+        }
+    }
 }
 
 /// NFC-normalize a segment if needed, using `buf` as scratch on the slow path.
@@ -263,6 +337,11 @@ fn apply_added_token_overwrites(
 }
 
 impl Tokenizer {
+    /// Default cache budget: 512 MiB per encode worker — large enough
+    /// that hit rates on diverse web-scale corpora match an unbounded
+    /// cache. `set_max_cache_bytes(None)` restores unbounded growth.
+    pub const DEFAULT_MAX_CACHE_BYTES: usize = 512 << 20;
+
     pub fn new(
         merges: HashMap<(TokenId, TokenId), TokenId, rustc_hash::FxBuildHasher>,
         vocab: Vec<Vec<u8>>,
@@ -288,8 +367,10 @@ impl Tokenizer {
     /// Shared construction tail ([`Self::new`], [`Self::new_ranked`] and
     /// [`Self::from_ranks`]): derive `vocab_inv` and the pair-rank table
     /// from the finished merges/vocab, seed the pretoken cache, and
-    /// assemble the tokenizer with default pipeline settings (GPT-2
-    /// pretokenization, no added tokens, no NFC).
+    /// assemble the tokenizer with placeholder pipeline settings (GPT-2
+    /// pretokenization, no added tokens, no NFC) that every loader must
+    /// overwrite for its actual scheme — see issue #40 for what relying
+    /// on the placeholder pretokenizer silently does.
     fn from_tables(
         merges: HashMap<(TokenId, TokenId), TokenId, rustc_hash::FxBuildHasher>,
         ranked_merges: Option<RankedMerges>,
@@ -319,6 +400,17 @@ impl Tokenizer {
             &mut token_arena,
             0,
         );
+        // The default budget's split is derived from the just-seeded
+        // state, so the seeded table above is the only build.
+        let n_seed = vocab
+            .iter()
+            .filter(|b| (1..=15).contains(&b.len()))
+            .count();
+        let cache_budget = Some(CacheBudget::derive(
+            Self::DEFAULT_MAX_CACHE_BYTES,
+            n_seed,
+            token_arena.len(),
+        ));
         Tokenizer {
             merges: Arc::new(merges),
             pair_ranks,
@@ -337,6 +429,7 @@ impl Tokenizer {
             normalize_nfc: false,
             add_prefix_space: false,
             ignore_merges: false,
+            cache_budget,
         }
     }
 
@@ -388,6 +481,35 @@ impl Tokenizer {
             .filter(|bytes| (1..=15).contains(&bytes.len()))
             .count();
         let mut cache = ShortPretokenCache::with_at_least(n_short, min_slots);
+        Self::seed_into(
+            &mut cache,
+            vocab,
+            byte_remapping,
+            pair_ranks,
+            merges,
+            ranked_merges,
+            ignore_merges,
+            vocab_inv,
+            token_arena,
+        );
+        cache
+    }
+
+    /// The seeding loop of [`Self::seeded_pretoken_cache`], populating
+    /// an existing (empty or seed-consistent) table in place, so the
+    /// generation wipe can re-seed without a fresh allocation.
+    #[allow(clippy::too_many_arguments)]
+    fn seed_into(
+        cache: &mut ShortPretokenCache,
+        vocab: &[Arc<[u8]>],
+        byte_remapping: Option<&ByteRemapping>,
+        pair_ranks: Option<&PairRankTable>,
+        merges: &HashMap<(TokenId, TokenId), TokenId, rustc_hash::FxBuildHasher>,
+        ranked_merges: Option<&RankedMerges>,
+        ignore_merges: bool,
+        vocab_inv: &HashMap<Arc<[u8]>, TokenId, rustc_hash::FxBuildHasher>,
+        token_arena: &mut Vec<TokenId>,
+    ) {
         let mut buf = [TokenId(0); SHORT_MERGE_MAX];
         for bytes in vocab {
             if !(1..=15).contains(&bytes.len()) {
@@ -413,7 +535,6 @@ impl Tokenizer {
                 cache.insert(key, h, val, ext);
             }
         }
-        cache
     }
 
     /// Seed-level encoding of one short vocab byte string under the
@@ -646,11 +767,19 @@ impl Tokenizer {
         // corpora more diverse than the OWT calibration. Clamped to 2^22
         // slots (128 MB) per worker.
         let distinct = 3.45 * (expected_bytes as f64).powf(0.62);
-        let cache_slots = ((distinct * (4.0 / 3.0) * 1.4) as usize)
+        let mut cache_slots = ((distinct * (4.0 / 3.0) * 1.4) as usize)
             .clamp(1 << 16, 1 << 22)
             .next_power_of_two();
-        let arena_cap = (expected_bytes / 256).min(1 << 24);
-        let long_cap = (expected_bytes / 8192).min(1 << 20);
+        let mut arena_cap = (expected_bytes / 256).min(1 << 24);
+        let mut long_cap = (expected_bytes / 8192).min(1 << 20);
+        if let Some(b) = &self.cache_budget {
+            // Each worker gets the FULL budget (a per-worker bound, not
+            // a pool to divide); the workload estimates keep their
+            // prealloc win but are clamped under the ceiling/sub-budgets.
+            cache_slots = cache_slots.min(b.short_slots);
+            arena_cap = arena_cap.min(b.arena_entries);
+            long_cap = long_cap.min(b.long_bytes / CacheBudget::LONG_ENTRY_BYTES);
+        }
         let mut token_arena = Vec::with_capacity(arena_cap);
         let mut pretoken_cache = Self::seeded_pretoken_cache(
             &self.vocab,
@@ -695,6 +824,12 @@ impl Tokenizer {
             normalize_nfc: self.normalize_nfc,
             add_prefix_space: self.add_prefix_space,
             ignore_merges: self.ignore_merges,
+            cache_budget: self.cache_budget.as_ref().map(|b| CacheBudget {
+                long_bytes_used: 0,
+                max_encoding: 0,
+                generations: 0,
+                ..b.clone()
+            }),
         }
     }
 
@@ -770,6 +905,147 @@ impl Tokenizer {
             &mut self.pretoken_cache,
             &mut self.token_arena,
         );
+        self.rederive_budget_if_set();
+    }
+
+    /// Bound the total memory of the encode caches (short pretoken table
+    /// + long-pretoken map + token arena), or remove the bound with
+    /// `None`. The default is `Some(`[`Self::DEFAULT_MAX_CACHE_BYTES`]`)`,
+    /// applied as part of construction.
+    ///
+    /// With a budget set, whenever the short table would grow past its
+    /// budgeted slot ceiling or the arena / long map crosses its
+    /// sub-budget, the miss path wipes all three back to seed-level
+    /// state (vocab seed + added-token overwrites) and encoding re-fills
+    /// them. Cache contents never affect encode output, so a wipe only
+    /// costs re-misses on previously cached pretokens.
+    ///
+    /// The short table takes the largest power-of-two slot count with
+    /// `slots * 32 <= 0.7 * budget` (raised as needed to keep headroom
+    /// over the vocab seed — budgets too small for the seed are floored,
+    /// not honored); the remainder splits evenly between arena and long
+    /// map. The slot count is a growth CEILING, not a preallocation, so
+    /// a tokenizer that never sees much data never pays the budget's
+    /// memory. Setting `Some` resets the caches to seed level (free at
+    /// the loader phase, where they are still seed-sized). Loader-phase
+    /// mutators re-derive the split from the mutated seed, so
+    /// budget/mutator call order does not matter, and forked workers
+    /// inherit the budget (each worker gets the FULL budget, not a
+    /// share).
+    pub fn set_max_cache_bytes(&mut self, budget: Option<usize>) {
+        let Some(total_bytes) = budget else {
+            self.cache_budget = None;
+            return;
+        };
+        let n_seed = self
+            .vocab
+            .iter()
+            .filter(|b| (1..=15).contains(&b.len()))
+            .count()
+            + self.added_tokens.len();
+        // Reset to seed level: the split is derived from the seed
+        // footprint, and starting from a known state needs no accounting
+        // for surviving contents.
+        self.pretoken_cache
+            .reset_to_capacity(ShortPretokenCache::required_capacity(n_seed, 0));
+        self.token_arena = Vec::new();
+        self.pretoken_cache_long = HashMap::with_hasher(rustc_hash::FxBuildHasher {});
+        self.reseed_cache();
+        self.cache_budget =
+            Some(CacheBudget::derive(total_bytes, n_seed, self.token_arena.len()));
+    }
+
+    /// The configured cache budget in bytes; `None` when unbounded.
+    pub fn max_cache_bytes(&self) -> Option<usize> {
+        self.cache_budget.as_ref().map(|b| b.total_bytes)
+    }
+
+    /// Current number of cached pretoken entries (short table + long
+    /// map). Grows as text is encoded and drops back toward vocab-seed
+    /// level when a budgeted cache wipes, so comparing it across encodes
+    /// tells you whether the bound engaged.
+    pub fn cache_entries(&self) -> usize {
+        self.pretoken_cache.len() + self.pretoken_cache_long.len()
+    }
+
+    /// Re-derive the budget split after a loader-phase mutation that
+    /// changes the seed footprint: a stale split could leave the grown
+    /// seed with no post-wipe headroom (worst case, a wipe per miss).
+    fn rederive_budget_if_set(&mut self) {
+        if let Some(total) = self.cache_budget.as_ref().map(|b| b.total_bytes) {
+            self.set_max_cache_bytes(Some(total));
+        }
+    }
+
+    /// Re-establish seed-level state in the existing short table and
+    /// arena: vocab seed, then added-token overwrites — value-identical
+    /// to a fresh fork's construction.
+    fn reseed_cache(&mut self) {
+        Self::seed_into(
+            &mut self.pretoken_cache,
+            &self.vocab,
+            self.byte_remapping.as_ref(),
+            self.pair_ranks.as_deref(),
+            &self.merges,
+            self.ranked_merges.as_deref(),
+            self.ignore_merges,
+            &self.vocab_inv,
+            &mut self.token_arena,
+        );
+        apply_added_token_overwrites(
+            &self.added_tokens,
+            &self.vocab_inv,
+            &mut self.pretoken_cache,
+            &mut self.token_arena,
+        );
+    }
+
+    /// Budget check at the top of the cache-miss path (before the miss's
+    /// own insert, so a wipe can never invalidate an arena offset the
+    /// insert just packed): wipes when the short table hits its growth
+    /// threshold AT its slot ceiling (below it, `grow()` proceeds as
+    /// always) or the arena / long map crosses its sub-budget. Returns
+    /// whether a wipe happened — the caller's probe-reported insert slot
+    /// is then stale.
+    #[inline]
+    fn wipe_if_over_budget(&mut self) -> bool {
+        let Some(b) = &self.cache_budget else {
+            return false;
+        };
+        let short_at_growth = self.pretoken_cache.capacity() >= b.short_slots
+            && (self.pretoken_cache.len() + 1) * 4 > self.pretoken_cache.capacity() * 3;
+        if !short_at_growth
+            && self.token_arena.len() <= b.arena_entries + b.max_encoding
+            && b.long_bytes_used <= b.long_bytes
+        {
+            return false;
+        }
+        self.wipe_generation();
+        true
+    }
+
+    /// The generation wipe: zero the short table in place (keeping its
+    /// budgeted allocation), drop accumulated arena tokens and long
+    /// entries, and re-seed. O(capacity + vocab), runs once per filled
+    /// budget; every discarded entry simply re-misses, so output is
+    /// unaffected.
+    #[cold]
+    #[inline(never)]
+    fn wipe_generation(&mut self) {
+        self.pretoken_cache.clear();
+        self.token_arena.clear();
+        self.pretoken_cache_long.clear();
+        self.reseed_cache();
+        let b = self
+            .cache_budget
+            .as_mut()
+            .expect("wipe_generation only runs with a budget set");
+        b.long_bytes_used = 0;
+        b.generations += 1;
+        // An oversized encoding can double the arena's allocation past
+        // its sub-budget mid-generation; give the excess back here so
+        // over-budget capacity is transient, not steady-state.
+        self.token_arena.shrink_to(b.arena_entries + 4096);
     }
 
     /// Set the added tokens matched atomically by
@@ -825,6 +1101,7 @@ impl Tokenizer {
             &mut self.pretoken_cache,
             &mut self.token_arena,
         );
+        self.rederive_budget_if_set();
     }
 
     /// Register one additional added token, extending the decode vocab when
@@ -837,28 +1114,43 @@ impl Tokenizer {
     ///
     /// [`WorkerPool`]: crate::batch::WorkerPool
     pub fn add_special_token(&mut self, content: Vec<u8>, id: TokenId) {
-        let idx = id.0 as usize;
-        // Loader-phase mutation of the shared model tables: `make_mut`
-        // copies only when a fork holds the tables too (never during
-        // loading, where this is called).
-        let vocab = Arc::make_mut(&mut self.vocab);
-        if idx >= vocab.len() {
-            vocab.resize(idx + 1, Arc::from(Vec::new().as_slice()));
-        }
-        if vocab[idx].is_empty() {
-            vocab[idx] = content.clone().into();
-            // If `content` duplicates an already-present vocab byte
-            // string, `vocab_inv` switches to the new ID (unconditional
-            // overwrite). The short-cache overwrite that keeps a matching
-            // pretoken resolving to `vocab_inv`'s answer happens in
-            // `set_added_tokens` below, which re-derives every added-token
-            // cache overwrite from the updated `vocab_inv` — the same
-            // computation a fork's reseed + re-apply performs (see
-            // [`Self::fork_sized`]), so parent and forked workers agree.
-            Arc::make_mut(&mut self.vocab_inv).insert(vocab[idx].clone(), id);
-        }
+        self.add_special_tokens([(content, id)]);
+    }
+
+    /// Register a batch of special added tokens: all vocab entries are
+    /// written first, then `set_added_tokens` rebuilds the matcher and the
+    /// cache overwrites once — not once per token, which would rebuild the
+    /// Aho-Corasick automaton and re-derive every overwrite each time.
+    pub fn add_special_tokens(&mut self, tokens: impl IntoIterator<Item = (Vec<u8>, TokenId)>) {
         let mut added = self.added_tokens.clone();
-        added.push(AddedTokenDef { content: content.into(), id, lstrip: false, rstrip: false });
+        for (content, id) in tokens {
+            let idx = id.0 as usize;
+            // Loader-phase mutation of the shared model tables: `make_mut`
+            // copies only when a fork holds the tables too (never during
+            // loading, where this is called).
+            let vocab = Arc::make_mut(&mut self.vocab);
+            if idx >= vocab.len() {
+                vocab.resize(idx + 1, Arc::from(Vec::new().as_slice()));
+            }
+            if vocab[idx].is_empty() {
+                vocab[idx] = content.clone().into();
+                // If `content` duplicates an already-present vocab byte
+                // string, `vocab_inv` switches to the new ID (unconditional
+                // overwrite). The short-cache overwrite that keeps a matching
+                // pretoken resolving to `vocab_inv`'s answer happens in
+                // `set_added_tokens` below, which re-derives every added-token
+                // cache overwrite from the updated `vocab_inv` — the same
+                // computation a fork's reseed + re-apply performs (see
+                // [`Self::fork_sized`]), so parent and forked workers agree.
+                Arc::make_mut(&mut self.vocab_inv).insert(vocab[idx].clone(), id);
+            }
+            added.push(AddedTokenDef {
+                content: content.into(),
+                id,
+                lstrip: false,
+                rstrip: false,
+            });
+        }
         self.set_added_tokens(added);
     }
 
@@ -1194,7 +1486,9 @@ impl Tokenizer {
                     } else {
                         let start = (val >> 32) as usize;
                         // SAFETY: recorded right after appending `len`
-                        // tokens at `start`; the arena never shrinks.
+                        // tokens at `start`; the arena only shrinks in a
+                        // generation wipe, which also clears every cache
+                        // entry referencing it.
                         let toks =
                             unsafe { self.token_arena.get_unchecked(start..start + len) };
                         out.extend_from_slice(token_ids_as_u32s(toks));
@@ -1270,6 +1564,11 @@ impl Tokenizer {
             let len = symbols.len() as u32;
             let offset = self.token_arena.len() as u32;
             self.token_arena.extend_from_slice(symbols);
+            // Accounted here, enforced by the next miss's budget check.
+            if let Some(b) = &mut self.cache_budget {
+                b.long_bytes_used += bytes.len() + CacheBudget::LONG_ENTRY_BYTES;
+                b.max_encoding = b.max_encoding.max(len as usize);
+            }
             self.pretoken_cache_long.insert(bytes.into(), (offset, len));
             out.extend_from_slice(token_ids_as_u32s(symbols));
         }
@@ -1290,6 +1589,30 @@ impl Tokenizer {
         slot: usize,
         out: &mut Vec<u32>,
     ) {
+        // Budget check FIRST: a wipe must precede this miss's `pack_val`
+        // (whose arena offsets it would otherwise truncate away) and
+        // invalidates the probe-reported `slot`, recomputed here.
+        let mut slot = slot;
+        if self.wipe_if_over_budget() && key != 0 {
+            match self.pretoken_cache.get_or_slot(key, h) {
+                Err(s) => slot = s,
+                Ok((val, ext)) => {
+                    // Unreachable (the reseeded table is a subset of the
+                    // pre-wipe table this key just missed in), but
+                    // serving the value is correct however we got here.
+                    debug_assert!(false, "post-wipe re-probe hit a key that missed pre-wipe");
+                    let len = (val & 0x7F) as usize;
+                    if val & VAL_SPILL == 0 {
+                        out.extend_from_slice(&unpack_val_lanes(val, ext)[..len]);
+                    } else {
+                        let start = (val >> 32) as usize;
+                        let toks = &self.token_arena[start..start + len];
+                        out.extend_from_slice(token_ids_as_u32s(toks));
+                    }
+                    return;
+                }
+            }
+        }
         // Rank-mapped vocabularies take the outlined
         // ranked miss path; the branch is one perfectly-predicted test for
         // everything else, keeping this function's codegen identical to a
@@ -1361,6 +1684,11 @@ impl Tokenizer {
             let len = symbols.len() as u32;
             let offset = self.token_arena.len() as u32;
             self.token_arena.extend_from_slice(symbols);
+            // Accounted here, enforced by the next miss's budget check.
+            if let Some(b) = &mut self.cache_budget {
+                b.long_bytes_used += bytes.len() + CacheBudget::LONG_ENTRY_BYTES;
+                b.max_encoding = b.max_encoding.max(len as usize);
+            }
             self.pretoken_cache_long.insert(bytes.into(), (offset, len));
             out.extend_from_slice(token_ids_as_u32s(symbols));
         }
@@ -1372,7 +1700,7 @@ impl Tokenizer {
             .copied()
     }
 
-    /// Detailed cache stats for memory accounting (see examples/cache_memory.rs):
+    /// Detailed cache stats for memory accounting:
     /// (short_len, short_cap, long_len, long_cap, long_key_bytes, arena_len, arena_cap).
     pub fn cache_mem_stats(&self) -> (usize, usize, usize, usize, usize, usize, usize) {
         let long_key_bytes: usize = self.pretoken_cache_long.keys().map(|k| k.len()).sum();
@@ -1700,7 +2028,8 @@ mod tests {
         let text = "This is a test string. Please tokenize it!";
         let data_dir = std::env::home_dir().unwrap().join("data");
         let tiktoken_path = data_dir.join("tokenizers/r50k_base.tiktoken");
-        let mut tokenizer = load_tiktoken(tiktoken_path).expect("Failed to load tokenizer");
+        let mut tokenizer = load_tiktoken(tiktoken_path, PretokenizerType::GPT2, Vec::new())
+            .expect("Failed to load tokenizer");
         let pretokenize_iter = crate::pretokenize::pretokenize_as_iter(text.as_bytes());
         let mut output = vec![];
         tokenizer.memoized_encode(pretokenize_iter, |tokens| {
@@ -1710,6 +2039,430 @@ mod tests {
         println!("Encoded: {:?}", output);
         let decoded = tokenizer.decode(&output).collect::<Vec<u8>>();
         println!("Decoded: {:?}", String::from_utf8_lossy(&decoded));
+    }
+
+    /// Byte-level tokenizer plus `extra_vocab` entries, `pairs` merge
+    /// rules (`(left, right, merged-id)`, rank = position) and `added`
+    /// special tokens, with GPT-2 pretokenization. `ranked` builds the
+    /// same model through the explicit-rank merge table, covering the
+    /// ranked miss path's wipe handling.
+    fn synth_tokenizer(
+        extra_vocab: Vec<Vec<u8>>,
+        pairs: &[(TokenId, TokenId, u32)],
+        added: &[(&[u8], u32)],
+        ranked: bool,
+    ) -> Tokenizer {
+        let mut vocab: Vec<Vec<u8>> = (0..=255u32).map(|b| vec![b as u8]).collect();
+        vocab.extend(extra_vocab);
+        let mut tok = if ranked {
+            let mut rm = RankedMerges::default();
+            for (rank, &(a, b, id)) in pairs.iter().enumerate() {
+                rm.insert(crate::bpe::ranked_merge_key(a, b), (TokenId(id), rank as u32));
+            }
+            Tokenizer::new_ranked(rm, vocab, None)
+        } else {
+            let mut merges: HashMap<(TokenId, TokenId), TokenId, rustc_hash::FxBuildHasher> =
+                HashMap::with_hasher(rustc_hash::FxBuildHasher {});
+            for &(a, b, id) in pairs {
+                merges.insert((a, b), TokenId(id));
+            }
+            Tokenizer::new(merges, vocab, None)
+        };
+        tok.set_pretokenizer_type(PretokenizerType::GPT2);
+        tok.add_special_tokens(added.iter().map(|&(c, id)| (c.to_vec(), TokenId(id))));
+        tok
+    }
+
+    /// Standard budget fixture: word merges (th/the/an/and/in/ing/er), a
+    /// pure special token, and an added token duplicating a vocab byte
+    /// string ("the" -> 301 overrides the merge result 257), so a
+    /// generation wipe must restore the added-token OVERWRITE, not just
+    /// the vocab seed.
+    fn budget_test_tokenizer(ranked: bool) -> Tokenizer {
+        let t = |b: u8| TokenId(b as u32);
+        let pairs = [
+            (t(b't'), t(b'h'), 256),
+            (TokenId(256), t(b'e'), 257),
+            (t(b'a'), t(b'n'), 258),
+            (TokenId(258), t(b'd'), 259),
+            (t(b'i'), t(b'n'), 260),
+            (TokenId(260), t(b'g'), 261),
+            (t(b'e'), t(b'r'), 262),
+        ];
+        let extra = [
+            b"th".as_slice(), b"the", b"an", b"and", b"in", b"ing", b"er",
+        ]
+        .map(<[u8]>::to_vec)
+        .to_vec();
+        let added: &[(&[u8], u32)] = &[(b"<|doc|>", 300), (b"the", 301)];
+        synth_tokenizer(extra, &pairs, added, ranked)
+    }
+
+    const LOWER: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
+    const MIXED: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+    /// `n` space-prefixed random words, `len` letters each, drawn
+    /// uniformly from `alphabet`.
+    fn random_words(
+        rng: &mut test_util::XorShift64,
+        n: usize,
+        len: usize,
+        alphabet: &[u8],
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        for _ in 0..n {
+            out.push(b' ');
+            for _ in 0..len {
+                out.push(alphabet[(rng.next_u64() % alphabet.len() as u64) as usize]);
+            }
+        }
+        out
+    }
+
+    /// Generation wipes performed since the budget was set (0 when
+    /// unbounded) — the internal counter the wipe-count regressions
+    /// assert on; deliberately not public API.
+    fn wipe_gens(tok: &Tokenizer) -> u64 {
+        tok.cache_budget.as_ref().map_or(0, |b| b.generations)
+    }
+
+    /// Corpus for the cache-budget tests: Zipf-ish common words, rare
+    /// random words (the distinct material that fills the caches and
+    /// spills 5+-token encodings into the arena), > 15-byte words (the
+    /// long-map path), digit runs, unicode, punctuation, and added-token
+    /// occurrences — all interleaved throughout, so every path runs both
+    /// before and after each wipe.
+    fn budget_test_corpus(n_words: usize, seed: u64) -> Vec<u8> {
+        let mut rng = test_util::XorShift64(seed);
+        let common: [&str; 20] = [
+            "the", "and", "ing", "her", "that", "with", "for", "was", "his", "not", "this",
+            "but", "from", "they", "she", "which", "were", "been", "have", "their",
+        ];
+        let unicode: [&str; 7] = [
+            "世界", "café", "naïve", "🦀🔥", "héllo", "Übung", "переменная",
+        ];
+        let mut out: Vec<u8> = Vec::new();
+        for i in 0..n_words {
+            match rng.next_u64() % 100 {
+                0..=39 => {
+                    // Zipf-ish head: min of two draws skews low indices.
+                    let idx = (rng.next_u64() % 20).min(rng.next_u64() % 20) as usize;
+                    out.extend_from_slice(common[idx].as_bytes());
+                }
+                40..=79 => {
+                    // Rare short words (<= 15 bytes with the leading
+                    // space): mostly-distinct cache pressure; 4+ letters
+                    // encode to 5+ tokens with the space, spilling to
+                    // the arena.
+                    let len = 3 + (rng.next_u64() % 8) as usize;
+                    for _ in 0..len {
+                        out.push(b'a' + (rng.next_u64() % 26) as u8);
+                    }
+                }
+                80..=86 => {
+                    // > 15 bytes: the long-map path.
+                    let len = 16 + (rng.next_u64() % 40) as usize;
+                    for _ in 0..len {
+                        out.push(b'a' + (rng.next_u64() % 26) as u8);
+                    }
+                }
+                87..=90 => {
+                    let len = 1 + (rng.next_u64() % 12) as usize;
+                    for _ in 0..len {
+                        out.push(b'0' + (rng.next_u64() % 10) as u8);
+                    }
+                }
+                91..=94 => {
+                    out.extend_from_slice(unicode[(rng.next_u64() % 7) as usize].as_bytes());
+                }
+                95..=96 => out.extend_from_slice(b"!?.,;:()[]{}--"),
+                97..=98 => out.extend_from_slice(b"<|doc|>"),
+                _ => out.extend_from_slice(b"the weather"),
+            }
+            out.push(if i % 17 == 0 { b'\n' } else { b' ' });
+        }
+        out
+    }
+
+    /// PARITY + BOUNDS: a budgeted tokenizer that wipes several times
+    /// mid-corpus must produce the exact token stream of a fresh
+    /// unbounded one — for both the id-as-rank and explicit-rank miss
+    /// paths — while every cache stays within its budgeted share
+    /// (modulo the documented one-miss overshoot window). Also pins
+    /// that a wipe restores the added-token overwrite ("the" -> 301),
+    /// observed through the raw memoized path where the cache entry is
+    /// what answers (the added-token matcher is not in front of it).
+    #[test]
+    fn budgeted_wipe_parity_and_bounds() {
+        for ranked in [false, true] {
+            let corpus = budget_test_corpus(300_000, 0x1234_5678_9ABC_DEF0);
+
+            let mut unbounded = budget_test_tokenizer(ranked);
+            unbounded.set_max_cache_bytes(None);
+            let mut expected: Vec<u32> = Vec::new();
+            unbounded.encode_with_added_tokens_flat(&corpus, &mut expected);
+            assert_eq!(wipe_gens(&unbounded), 0);
+
+            let mut budgeted = budget_test_tokenizer(ranked);
+            budgeted.set_max_cache_bytes(Some(4 << 20));
+            let (short_slots, arena_entries, long_bytes) = {
+                let b = budgeted.cache_budget.as_ref().unwrap();
+                (b.short_slots, b.arena_entries, b.long_bytes)
+            };
+            assert!(
+                budgeted.pretoken_cache.capacity() <= short_slots,
+                "short table starts above its ceiling"
+            );
+
+            // A budgeted fork inherits the full budget with fresh counters.
+            let fork = budgeted.fork();
+            assert!(fork.pretoken_cache.capacity() <= short_slots);
+            let fb = fork.cache_budget.as_ref().unwrap();
+            assert_eq!(fb.total_bytes, 4 << 20);
+            assert_eq!((fb.generations, fb.long_bytes_used), (0, 0));
+
+            let mut actual: Vec<u32> = Vec::new();
+            budgeted.encode_with_added_tokens_flat(&corpus, &mut actual);
+
+            let gens = wipe_gens(&budgeted);
+            assert!(
+                gens >= 3,
+                "expected several wipes at a 4 MB budget, got {gens} (ranked={ranked})"
+            );
+            assert_eq!(
+                actual.len(),
+                expected.len(),
+                "token count diverged (ranked={ranked})"
+            );
+            if let Some(i) = (0..actual.len()).find(|&i| actual[i] != expected[i]) {
+                panic!(
+                    "first divergence at token {i}: {} vs {} (ranked={ranked})",
+                    actual[i], expected[i]
+                );
+            }
+
+            let (short_len, short_cap, _, _, long_key_bytes, arena_len, _) =
+                budgeted.cache_mem_stats();
+            let b = budgeted.cache_budget.as_ref().unwrap();
+            assert!(short_cap <= short_slots, "short table grew past its ceiling");
+            assert!(short_len * 4 <= short_cap * 3, "short table past 3/4 load");
+            assert!(
+                arena_len <= arena_entries + b.max_encoding + 256,
+                "arena_len {arena_len} exceeds its budget {arena_entries}"
+            );
+            assert!(
+                b.long_bytes_used <= long_bytes + 4096,
+                "long map {} exceeds its budget {long_bytes}",
+                b.long_bytes_used
+            );
+            assert!(long_key_bytes <= b.long_bytes_used);
+
+            let encode_raw = |t: &mut Tokenizer, input: &[u8]| -> Vec<TokenId> {
+                let mut out = Vec::new();
+                t.memoized_encode(crate::pretokenize::pretokenize_as_iter(input), |toks| {
+                    out.extend_from_slice(toks)
+                });
+                out
+            };
+            assert_eq!(
+                encode_raw(&mut budgeted, b"the"),
+                vec![TokenId(301)],
+                "wipe lost the added-token overwrite (ranked={ranked})"
+            );
+            assert_eq!(encode_raw(&mut unbounded, b"the"), vec![TokenId(301)]);
+
+            // Dropping the budget restores unbounded semantics without
+            // touching cache contents.
+            budgeted.set_max_cache_bytes(None);
+            assert_eq!(wipe_gens(&budgeted), 0);
+            assert!(budgeted.cache_budget.is_none());
+        }
+    }
+
+    /// HEADROOM: pins the near-seed-boundary thrash pathology (measured:
+    /// hundreds of wipes before the 5/8 floor) — a vocab whose
+    /// short-entry count lands just under `required_capacity`'s 3/4
+    /// bound (~48.8k vs 49152 for 2^16 slots) must get its ceiling
+    /// doubled so wipes scale with distinct-pretokens / headroom.
+    #[test]
+    fn budgeted_wipe_headroom_near_seed_boundary() {
+        let extra = (0..48_500u32).map(|i| format!("v{i:05}").into_bytes()).collect();
+        let mut tok = synth_tokenizer(extra, &[], &[], false);
+        tok.set_max_cache_bytes(Some(4 << 20));
+        let short_slots = tok.cache_budget.as_ref().unwrap().short_slots;
+        assert!(
+            tok.pretoken_cache.len() * 8 <= short_slots * 5,
+            "seed {} over 5/8 of {short_slots} slots",
+            tok.pretoken_cache.len()
+        );
+
+        // ~124k distinct 3-letter words: 4-token inline values, so the
+        // short table is the only wipe trigger.
+        let mut rng = test_util::XorShift64(0x0DDB_1A5E_5BAD_5EED);
+        let corpus = random_words(&mut rng, 300_000, 3, MIXED);
+        let mut out: Vec<u32> = Vec::new();
+        tok.encode_with_added_tokens_flat(&corpus, &mut out);
+        assert!(!out.is_empty());
+
+        let gens = wipe_gens(&tok);
+        assert!(gens >= 1, "corpus no longer fills the table");
+        assert!(gens <= 10, "wipe-thrash: {gens} wipes for ~124k distinct pretokens");
+        let (_, short_cap, ..) = tok.cache_mem_stats();
+        assert_eq!(short_cap, short_slots, "a wiping table sits exactly at its ceiling");
+    }
+
+    /// GIANT PRETOKEN: a recurring pretoken whose encoding alone exceeds
+    /// the arena sub-budget must not force a wipe per occurrence — the
+    /// arena trigger carries slack for the largest single encoding seen,
+    /// so the giant re-overflowing a freshly wiped arena cannot itself
+    /// re-trigger the wipe.
+    #[test]
+    fn budgeted_wipe_giant_pretoken_no_thrash() {
+        let mut rng = test_util::XorShift64(0x61A7_0000_C0FF_EE00);
+        // One 300k-letter pretoken; 'h' excluded so the added token
+        // "the" cannot split it into many medium segments (a different
+        // overflow shape than the single-encoding one pinned here).
+        let giant = random_words(&mut rng, 1, 300_000, b"abcdefgijklmnopqrstuvwxyz");
+        let occurrences = 30usize;
+        let mut corpus = Vec::new();
+        for i in 0..occurrences {
+            corpus.extend_from_slice(&giant);
+            corpus.extend_from_slice(format!(" filler{i} words here\n").as_bytes());
+        }
+
+        let mut unbounded = budget_test_tokenizer(false);
+        unbounded.set_max_cache_bytes(None);
+        let mut expected: Vec<u32> = Vec::new();
+        unbounded.encode_with_added_tokens_flat(&corpus, &mut expected);
+
+        let mut tok = budget_test_tokenizer(false);
+        tok.set_max_cache_bytes(Some(4 << 20));
+        // Test premise: the giant's ~297k-token encoding exceeds the
+        // arena sub-budget outright.
+        let arena_entries = tok.cache_budget.as_ref().unwrap().arena_entries;
+        assert!(
+            arena_entries < 290_000,
+            "premise broken: arena sub-budget {arena_entries} no longer \
+             below the giant's encoding"
+        );
+        let mut out: Vec<u32> = Vec::new();
+        tok.encode_with_added_tokens_flat(&corpus, &mut out);
+        assert_eq!(out, expected, "budgeted output diverged");
+
+        let gens = wipe_gens(&tok);
+        assert!(
+            (gens as usize) <= 2,
+            "wipe per giant occurrence: {gens} wipes for {occurrences} occurrences"
+        );
+    }
+
+    /// REDERIVE: loader-phase mutations after a budget is set must
+    /// recompute the split. Regression: a tight budget's arena floor is
+    /// derived from the seed's spill footprint; growing the seed
+    /// afterwards (added tokens whose contents seed as arena spills)
+    /// under a stale floor would leave the post-wipe seed alone over
+    /// budget — a wipe on every miss, forever.
+    #[test]
+    fn budgeted_rederive_after_loader_mutation() {
+        let mut unbounded = budget_test_tokenizer(false);
+        unbounded.set_max_cache_bytes(None);
+        let mut tok = budget_test_tokenizer(false);
+        // Tight budget: the short table swallows all of it, so the arena
+        // sub-budget sits at its seed-derived floor.
+        tok.set_max_cache_bytes(Some(2 << 20));
+        let stale_arena = tok.cache_budget.as_ref().unwrap().arena_entries;
+        assert!(stale_arena < 8192, "premise: floor-bound arena sub-budget, got {stale_arena}");
+
+        // 2000 added tokens whose 11-byte contents seed as 11-token
+        // arena spills: 22k entries, far past the stale 4096 floor.
+        let added: Vec<(Vec<u8>, TokenId)> = (0..2000u32)
+            .map(|i| (format!("«tok{i:04}»").into_bytes(), TokenId(1000 + i)))
+            .collect();
+        tok.add_special_tokens(added.clone());
+        unbounded.add_special_tokens(added);
+
+        let b = tok.cache_budget.as_ref().unwrap();
+        assert_eq!(b.total_bytes, 2 << 20, "budget lost across loader mutation");
+        assert_eq!(b.generations, 0);
+        let arena_entries = b.arena_entries;
+        assert!(
+            tok.token_arena.len() <= arena_entries,
+            "re-derived arena floor {arena_entries} below the new seed {}",
+            tok.token_arena.len()
+        );
+        assert!(arena_entries > stale_arena);
+
+        let corpus = budget_test_corpus(50_000, 0xFEED_FACE_CAFE_F00D);
+        let mut expected: Vec<u32> = Vec::new();
+        unbounded.encode_with_added_tokens_flat(&corpus, &mut expected);
+        let mut out: Vec<u32> = Vec::new();
+        tok.encode_with_added_tokens_flat(&corpus, &mut out);
+        assert_eq!(out, expected, "budgeted output diverged");
+
+        let gens = wipe_gens(&tok);
+        assert!(gens >= 1);
+        assert!(
+            gens <= 40,
+            "wipe-thrash after loader mutation: {gens} wipes for 50k words"
+        );
+        let b = tok.cache_budget.as_ref().unwrap();
+        let (_, _, _, _, _, arena_len, _) = tok.cache_mem_stats();
+        assert!(arena_len <= b.arena_entries + b.max_encoding + 256);
+    }
+
+    /// DEFAULT LIFECYCLE: a fresh tokenizer reports the default budget
+    /// and builds its table ONCE at seed size — no ceiling presize, no
+    /// eager arena prealloc (measured: the naive default-on cost every
+    /// construction ~2x 256 MiB memsets + reseeds) — then grows by
+    /// normal doubling below the budgeted ceiling with zero wipes, and
+    /// wipes only once load hits 3/4 AT the ceiling. `None` is the
+    /// unbounded escape hatch.
+    #[test]
+    fn default_budget_lifecycle() {
+        // The fixture runs a loader-shaped sequence: constructor,
+        // set_pretokenizer_type, add_special_tokens.
+        let mut tok = budget_test_tokenizer(false);
+        assert_eq!(tok.max_cache_bytes(), Some(Tokenizer::DEFAULT_MAX_CACHE_BYTES));
+        assert_eq!(tok.fork().max_cache_bytes(), tok.max_cache_bytes());
+        assert_eq!(
+            tok.pretoken_cache.capacity(),
+            1 << 16,
+            "default budget must not presize the table"
+        );
+        assert!(tok.token_arena.capacity() < 1 << 20, "eager arena preallocation");
+        // Loader-phase mutation re-derives the split.
+        tok.add_special_tokens([(b"<|extra|>".to_vec(), TokenId(400))]);
+        assert_eq!(tok.pretoken_cache.capacity(), 1 << 16);
+        assert_eq!(tok.max_cache_bytes(), Some(Tokenizer::DEFAULT_MAX_CACHE_BYTES));
+
+        // 16 MiB gives a 2^18-slot ceiling to observe growth against;
+        // the ceiling-growth mechanics are budget-independent.
+        tok.set_max_cache_bytes(Some(16 << 20));
+        let ceiling = tok.cache_budget.as_ref().unwrap().short_slots;
+        assert_eq!(ceiling, 1 << 18);
+        assert_eq!(tok.pretoken_cache.capacity(), 1 << 16, "budget must not presize either");
+
+        let mut rng = test_util::XorShift64(0xCE11_1216_5107_C047);
+        let mut out: Vec<u32> = Vec::new();
+        // ~35k distinct 3-letter words: under the seed table's 3/4
+        // threshold (inline 4-token values — no arena traffic).
+        tok.encode_with_added_tokens_flat(&random_words(&mut rng, 40_000, 3, MIXED), &mut out);
+        assert_eq!(wipe_gens(&tok), 0);
+        assert_eq!(tok.pretoken_cache.capacity(), 1 << 16, "grew too early");
+        // ~140k distinct: grows 2^16 -> 2^17 -> 2^18 with zero wipes
+        // (the ceiling's 196k threshold is unreachable with 3 letters).
+        tok.encode_with_added_tokens_flat(&random_words(&mut rng, 600_000, 3, MIXED), &mut out);
+        assert_eq!(wipe_gens(&tok), 0, "wiped below the ceiling");
+        assert_eq!(tok.pretoken_cache.capacity(), ceiling, "must reach the ceiling");
+        // ~120k more distinct 4-letter words push load past 3/4 AT the
+        // ceiling (spills stay well under the arena sub-budget).
+        tok.encode_with_added_tokens_flat(&random_words(&mut rng, 150_000, 4, LOWER), &mut out);
+        assert!(wipe_gens(&tok) >= 1, "no wipe at the ceiling");
+        assert_eq!(tok.pretoken_cache.capacity(), ceiling, "wipe must keep the ceiling");
+
+        tok.set_max_cache_bytes(None);
+        assert_eq!(tok.max_cache_bytes(), None);
+        assert_eq!(tok.fork().max_cache_bytes(), None);
     }
 }
 

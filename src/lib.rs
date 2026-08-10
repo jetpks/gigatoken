@@ -32,7 +32,9 @@ use crate::bindings::matcher::{SpecialTokenFound, SubstringMatcher};
 #[cfg(feature = "python")]
 use crate::bindings::padding;
 #[cfg(feature = "python")]
-use crate::bindings::pretokenize::{PretokenizerIter, pretokenized_counts, pretokenizer};
+use crate::bindings::pretokenize::{
+    PretokenizerIter, pretokenized_counts, pretokenizer, pretokenizer_scheme,
+};
 #[cfg(feature = "python")]
 use crate::bindings::sources::{
     BytesSource, FileSource, JsonlFileSource, ParquetFileSource, TextFileSource,
@@ -50,6 +52,8 @@ use pyo3::prelude::*;
 use pyo3::pybacked::{PyBackedBytes, PyBackedStr};
 #[cfg(feature = "python")]
 use pyo3::types::{PyBytes, PyDict, PyList};
+#[cfg(feature = "python")]
+use std::collections::HashMap;
 #[cfg(feature = "python")]
 use std::path::PathBuf;
 
@@ -83,30 +87,24 @@ impl BPETokenizer {
 #[cfg(feature = "python")]
 #[pymethods]
 impl BPETokenizer {
+    /// Load from a .tiktoken rank file with the named pretokenizer scheme
+    /// and, optionally, a {content: id} mapping of special tokens. The file
+    /// carries neither, so both are the caller's to supply — see
+    /// `gigatoken.Tokenizer.from_tiktoken`, which knows them for the
+    /// encodings OpenAI publishes.
     #[staticmethod]
-    fn from_tiktoken(path: PathBuf) -> PyResult<Self> {
-        Ok(Self {
-            tokenizer: load_tokenizer::tiktoken::load_tiktoken(&path)?,
-            workers: WorkerPool::new(),
-        })
-    }
-    /// Load from a tiktoken rank file plus a tokenizer_config.json carrying
-    /// the special tokens — the layout of repos that ship no tokenizer.json
-    /// (e.g. the moonshotai Kimi line) — with the named pretokenizer scheme.
-    #[staticmethod]
-    fn from_tiktoken_model(
-        model_path: PathBuf,
-        config_path: PathBuf,
+    #[pyo3(signature = (path, pretokenizer, special_tokens = None))]
+    fn from_tiktoken(
+        path: PathBuf,
         pretokenizer: &str,
+        special_tokens: Option<HashMap<String, u32>>,
     ) -> PyResult<Self> {
-        let scheme = pretokenize::PretokenizerType::from_name(pretokenizer).ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown pretokenizer scheme {pretokenizer:?}; expected one of \
-                 gpt2, gpt4, qwen2, qwen35, olmo3, deepseek_v3, o200k, nemotron, kimi"
-            ))
-        })?;
+        let scheme = pretokenizer_scheme(pretokenizer)?;
+        let special_tokens = special_tokens.unwrap_or_default().into_iter().collect();
         Ok(Self {
-            tokenizer: load_tokenizer::tiktoken::load_tiktoken_model(&model_path, &config_path, scheme)?,
+            tokenizer: bindings::cache::apply_max_cache_bytes(
+                load_tokenizer::tiktoken::load_tiktoken(&path, scheme, special_tokens)?,
+            ),
             workers: WorkerPool::new(),
         })
     }
@@ -114,7 +112,9 @@ impl BPETokenizer {
     #[staticmethod]
     fn from_hf(path: PathBuf) -> PyResult<Self> {
         Ok(Self {
-            tokenizer: load_tokenizer::hf::load_hf_bpe(&path)?,
+            tokenizer: bindings::cache::apply_max_cache_bytes(load_tokenizer::hf::load_hf_bpe(
+                &path,
+            )?),
             workers: WorkerPool::new(),
         })
     }
@@ -276,6 +276,14 @@ impl BPETokenizer {
         Ok(self.tokenizer.decode(ids.as_slice()?).collect())
     }
 
+    /// Cached pretoken entries on the single-document `encode` path's
+    /// tokenizer (batch workers keep their own caches): grows as text is
+    /// encoded, drops back toward vocab-seed level when a budgeted cache
+    /// wipes (see gigatoken.set_max_cache_bytes).
+    fn cache_entries(&self) -> usize {
+        self.tokenizer.cache_entries()
+    }
+
     fn __repr__(&self) -> PyResult<String> {
         Ok(format!("{:?}", self.tokenizer))
     }
@@ -344,6 +352,15 @@ impl SentencePieceTokenizer {
             }
         })
     }
+
+    /// Wrap a loaded model, applying the global cache budget to it and to
+    /// the single-document encode state.
+    fn with_model(model: bpe::SentencePieceBPE) -> Self {
+        let tokenizer = bindings::cache::apply_max_cache_bytes_sp(model);
+        let state =
+            bpe::sentencepiece::EncodeState::with_budget(tokenizer.max_cache_bytes());
+        Self { tokenizer, state }
+    }
 }
 
 #[cfg(feature = "python")]
@@ -351,10 +368,7 @@ impl SentencePieceTokenizer {
 impl SentencePieceTokenizer {
     #[staticmethod]
     fn from_hf(path: PathBuf) -> PyResult<Self> {
-        Ok(Self {
-            tokenizer: load_tokenizer::hf::load_hf_sentencepiece(&path)?,
-            state: bpe::sentencepiece::EncodeState::new(),
-        })
+        Ok(Self::with_model(load_tokenizer::hf::load_hf_sentencepiece(&path)?))
     }
 
     /// Encode a batch of documents in parallel, releasing the GIL. Accepts
@@ -502,6 +516,12 @@ impl SentencePieceTokenizer {
         Ok(self.tokenizer.decode(ids.as_slice()?))
     }
 
+    /// Cached unit entries on the single-document `encode` path's state
+    /// (batch encoders are per-call); see `BPETokenizer.cache_entries`.
+    fn cache_entries(&self) -> usize {
+        self.state.cache_size()
+    }
+
     fn __repr__(&self) -> PyResult<String> {
         Ok(format!("{:?}", self.tokenizer))
     }
@@ -532,19 +552,14 @@ fn load_hf_json(py: Python<'_>, data: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         load_tokenizer::hf::HfTokenizer::Bpe(tokenizer) => Ok(Py::new(
             py,
             BPETokenizer {
-                tokenizer,
+                tokenizer: bindings::cache::apply_max_cache_bytes(tokenizer),
                 workers: WorkerPool::new(),
             },
         )?
         .into_any()),
-        load_tokenizer::hf::HfTokenizer::SentencePiece(tokenizer) => Ok(Py::new(
-            py,
-            SentencePieceTokenizer {
-                tokenizer,
-                state: bpe::sentencepiece::EncodeState::new(),
-            },
-        )?
-        .into_any()),
+        load_tokenizer::hf::HfTokenizer::SentencePiece(tokenizer) => {
+            Ok(Py::new(py, SentencePieceTokenizer::with_model(tokenizer))?.into_any())
+        }
     }
 }
 
@@ -574,5 +589,7 @@ fn gigatoken_rs<'py>(py: Python, m: &Bound<'py, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bindings::hub::hub_file, m)?)?;
     m.add_function(wrap_pyfunction!(bindings::hub::looks_like_repo_id, m)?)?;
     m.add_function(wrap_pyfunction!(bindings::hub::get_hf_token, m)?)?;
+    m.add_function(wrap_pyfunction!(bindings::cache::set_max_cache_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(bindings::cache::get_max_cache_bytes, m)?)?;
     Ok(())
 }
