@@ -9,6 +9,37 @@ module Gigatoken
     DATA_DIR = File.expand_path("encodings", __dir__)
     private_constant :DATA_DIR
 
+    # o200k_harmony's ten named control tokens, plus the six reserved slots
+    # sitting in the gaps between them (200000, 200001, 200004, 200009,
+    # 200010, 200011) — the non-contiguous head of openai_public.py's
+    # o200k_harmony() special-token table, transcribed verbatim (see
+    # PROVENANCE.md). Its reserved range only goes contiguous at 200013.
+    HARMONY_NAMED_TOKENS = {
+      "<|startoftext|>" => 199998,
+      "<|endoftext|>" => 199999,
+      "<|reserved_200000|>" => 200000,
+      "<|reserved_200001|>" => 200001,
+      "<|return|>" => 200002,
+      "<|constrain|>" => 200003,
+      "<|reserved_200004|>" => 200004,
+      "<|channel|>" => 200005,
+      "<|start|>" => 200006,
+      "<|end|>" => 200007,
+      "<|message|>" => 200008,
+      "<|reserved_200009|>" => 200009,
+      "<|reserved_200010|>" => 200010,
+      "<|reserved_200011|>" => 200011,
+      "<|call|>" => 200012,
+      "<|endofprompt|>" => 200018
+    }.freeze
+    private_constant :HARMONY_NAMED_TOKENS
+
+    # The contiguous tail of o200k_harmony's reserved range: 200013..201087.
+    # Combined with HARMONY_NAMED_TOKENS that's 1091 entries total (10
+    # named, 1081 reserved) — see PROVENANCE.md and AC4.
+    HARMONY_RESERVED_TOKENS = (200013..201087).to_h { |id| ["<|reserved_#{id}|>", id] }.freeze
+    private_constant :HARMONY_RESERVED_TOKENS
+
     REGISTRY = {
       "r50k_base" => {
         rank_file: File.join(DATA_DIR, "r50k_base.tiktoken"),
@@ -30,6 +61,11 @@ module Gigatoken
         rank_file: File.join(DATA_DIR, "o200k_base.tiktoken"),
         pretokenizer: "o200k",
         special_tokens: {"<|endoftext|>" => 199999, "<|endofprompt|>" => 200018}
+      },
+      "o200k_harmony" => {
+        rank_file: File.join(DATA_DIR, "o200k_base.tiktoken"),
+        pretokenizer: "o200k",
+        special_tokens: HARMONY_NAMED_TOKENS.merge(HARMONY_RESERVED_TOKENS).freeze
       }
     }.freeze
     private_constant :REGISTRY
@@ -44,7 +80,9 @@ module Gigatoken
     # reason a caller asking for one by name deserves to hear.
     UNPACKABLE_REASONS = {
       "p50k_base" => "its ranks are not dense (50256 is left free for <|endoftext|>), " \
-        "and the rank loader rejects non-dense ranks"
+        "and the rank loader rejects non-dense ranks",
+      "p50k_edit" => "it loads the same p50k_base.tiktoken ranks, which are not dense " \
+        "(50256 is left free for <|endoftext|>), and the rank loader rejects non-dense ranks"
     }.freeze
     private_constant :UNPACKABLE_REASONS
 
