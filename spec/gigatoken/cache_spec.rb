@@ -29,9 +29,23 @@ RSpec.describe "Gigatoken.max_cache_bytes" do
   end
 
   it "applies a changed budget to tokenizers built afterward" do
-    Gigatoken.max_cache_bytes = 5 * 1024 * 1024
-    tokenizer = Gigatoken::Tokenizer.from_file(fixture_path)
-    expect(tokenizer.cache_entries).to be_a(Integer)
+    rng = Random.new(1234)
+    words = Array.new(20_000) { Array.new(rng.rand(6..10)) { (rng.rand(26) + "a".ord).chr }.join }
+    text = words.join(" ")
+
+    Gigatoken.max_cache_bytes = 64 * 1024
+    small = Gigatoken::Tokenizer.from_file(fixture_path)
+    small_seed = small.cache_entries
+    small.encode(text)
+    small_growth = small.cache_entries - small_seed
+
+    Gigatoken.max_cache_bytes = 256 * 1024 * 1024
+    large = Gigatoken::Tokenizer.from_file(fixture_path)
+    large_seed = large.cache_entries
+    large.encode(text)
+    large_growth = large.cache_entries - large_seed
+
+    expect(small_growth).to be < large_growth / 10
   end
 
   it "grows cache_entries as pretokens outside the vocab seed are encoded" do

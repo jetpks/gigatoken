@@ -48,7 +48,7 @@ tok.vocab_size                          # => 50257
 tok.special_tokens                      # => {"<|endoftext|>" => 50256}
 ```
 
-`load` takes a `tokenizer.json` path, a directory holding one, a HuggingFace Hub repo id, or a `.tiktoken` mergeable-ranks file, and dispatches on shape. Hub downloads run over socketry's `async-http` — no Python anywhere. Know what you have? Skip the dispatch:
+`load` takes a `tokenizer.json` path, a directory holding one, a packaged tiktoken encoding name (`r50k_base`, `cl100k_base`, `o200k_base`), a HuggingFace Hub repo id, or a `.tiktoken` mergeable-ranks file, and dispatches on shape. Hub downloads run over socketry's `async-http` — no Python anywhere. Know what you have? Skip the dispatch:
 
 ```ruby
 Gigatoken::Tokenizer.from_file("tokenizer.json")
@@ -60,6 +60,25 @@ Gigatoken::Tokenizer.from_json(File.binread("tokenizer.json"))
 A `.tiktoken` file holds mergeable ranks only — its pretokenization scheme and special tokens live in the code that defines the encoding, not the file — so `pretokenizer:` is a required keyword (one of `Gigatoken::Native.pretokenizer_names`: `gpt2`/`r50k`, `gpt4`/`cl100k`, `qwen2`, `qwen35`, `olmo3`, `deepseek_v3`, `o200k`, `nemotron`, `kimi`) and `special_tokens:` defaults to none. Nothing is guessed: an unknown scheme raises `Gigatoken::Error` naming the valid ones, and `Tokenizer.load` on a `.tiktoken` path with no `pretokenizer:` raises rather than silently picking one.
 
 SentencePiece-BPE models (Llama, Gemma, Mistral — any `tokenizer.json` with `byte_fallback: true`) load through the same entry points and pick the right backend automatically. One difference: the SentencePiece core decodes text, so it validates input and raises `Gigatoken::Error` on invalid UTF-8 instead of guessing.
+
+### Packaged tiktoken encodings
+
+`r50k_base`, `cl100k_base`, and `o200k_base` are vendored directly — mergeable ranks, pretokenizer scheme, and special-token table all shipped inside the gem (`lib/gigatoken/encodings/`; see `PROVENANCE.md` there for exact source URLs and hashes) — so both entry points resolve them by name entirely offline: no network access, no writable cache directory.
+
+```ruby
+Gigatoken::Tokenizer.from_encoding("cl100k_base")
+Gigatoken::Tokenizer.load("cl100k_base")          # same result — packaged names are
+                                                   # checked before the Hub-repo-id shape
+```
+
+`p50k_base` is deliberately not packaged: its ranks are not dense (id 50256 is left free for `<|endoftext|>`), and the rank loader rejects non-dense ranks. Both entry points raise `Gigatoken::Error` explaining that, rather than `load` falling through to the Hub for a name that happens to look like a legacy repo id.
+
+`encode` on a packaged tokenizer honours its special-token table: text containing `<|endoftext|>` (or any other literal special-token string) is tokenized as that special token, not as ordinary text. That matches [`tiktoken`](https://github.com/openai/tiktoken)'s `encode_with_special_tokens`, not its plain `encode`, which treats the same literal as ordinary text — a difference worth knowing if you're tokenizing untrusted input. To get tiktoken's non-honouring default instead, build a tokenizer from the same rank file with an empty special-token table:
+
+```ruby
+entry = Gigatoken::Encodings["cl100k_base"]
+Gigatoken::Tokenizer.from_tiktoken(entry[:rank_file], pretokenizer: entry[:pretokenizer], special_tokens: {})
+```
 
 ### Encode-cache budget
 
