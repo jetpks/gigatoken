@@ -296,6 +296,8 @@ pub struct SentencePieceBPE {
     /// Bitset over the byte just before a candidate boundary (the last byte
     /// of some `cross_pieces` pre) for a one-load rejection in the scanner.
     pub(crate) cross_prev: [u64; 4],
+    /// Cache budget snapshot by each [`Self::encoder`]; `None` = unbounded.
+    pub(crate) max_cache_bytes: Option<usize>,
 }
 
 /// How many distinct punctuation bytes the unit splitter checks for.
@@ -764,8 +766,20 @@ impl SentencePieceBPE {
     pub fn encoder(&self) -> Encoder<'_> {
         Encoder {
             model: self,
-            state: EncodeState::new(),
+            state: EncodeState::with_budget(self.max_cache_bytes),
         }
+    }
+
+    /// SentencePiece analog of [`super::Tokenizer::set_max_cache_bytes`],
+    /// same default: bounds the caches of [`EncodeState`]s created
+    /// afterward, which wipe back to empty (there is no vocab seed here).
+    pub fn set_max_cache_bytes(&mut self, budget: Option<usize>) {
+        self.max_cache_bytes = budget;
+    }
+
+    /// The configured cache budget in bytes; `None` when unbounded.
+    pub fn max_cache_bytes(&self) -> Option<usize> {
+        self.max_cache_bytes
     }
 
     /// Size of the vocabulary: one greater than the largest token ID,
@@ -854,6 +868,14 @@ fn collapse_space_runs(input: &str, content: &str) -> String {
 /// Zipf-hot working set resident despite eviction churn from tail units.
 const FRONT_BITS: u32 = 20;
 
+/// Fixed footprint of the front cache (keys + vals), subtracted from the
+/// budget before bounding the growing caches.
+const FRONT_BYTES: usize = (1 << FRONT_BITS) * (16 + 8);
+/// Estimated bytes per map entry, payload + SwissTable slack (`long` adds
+/// its key bytes on top). Length-based, because the wipe keeps allocations.
+const SHORT_ENTRY_BYTES: usize = 48;
+const LONG_ENTRY_BYTES: usize = 48;
+
 /// Index of `key` in the front cache: multiplicative hash, top bits.
 #[inline(always)]
 fn front_index(key: u128) -> usize {
@@ -882,10 +904,26 @@ pub struct EncodeState {
     symbols: Vec<TokenId>,
     /// Scratch for composing keys with a virtual leading space.
     key_buf: Vec<u8>,
+    /// Byte budget for the growing caches ([`Self::with_budget`]);
+    /// `usize::MAX` = unbounded.
+    budget: usize,
+    /// Estimated `long` bytes: key bytes + [`LONG_ENTRY_BYTES`] per entry.
+    long_bytes_used: usize,
+    /// Largest single encoding, as wipe-trigger slack: one recurring giant
+    /// unit must not force a wipe per occurrence. Kept across wipes.
+    max_encoding: usize,
 }
 
 impl EncodeState {
     pub fn new() -> Self {
+        Self::with_budget(Some(super::Tokenizer::DEFAULT_MAX_CACHE_BYTES))
+    }
+
+    /// A state whose growing caches (short/long maps + arena; the front
+    /// cache is fixed-size) wipe back to empty when their estimated
+    /// footprint exceeds `max_bytes` minus the front cache, floored at
+    /// 1 MiB so tiny budgets stay functional.
+    pub fn with_budget(max_bytes: Option<usize>) -> Self {
         EncodeState {
             arena: Vec::new(),
             front_keys: vec![0u128; 1 << FRONT_BITS],
@@ -894,12 +932,34 @@ impl EncodeState {
             long: HashMap::with_hasher(FxBuildHasher),
             symbols: Vec::new(),
             key_buf: Vec::new(),
+            budget: max_bytes
+                .map_or(usize::MAX, |t| t.saturating_sub(FRONT_BYTES).max(1 << 20)),
+            long_bytes_used: 0,
+            max_encoding: 0,
         }
     }
 
     /// Number of cached units (for diagnostics).
     pub fn cache_size(&self) -> usize {
         self.short.len() + self.long.len()
+    }
+
+    #[inline]
+    fn over_budget(&self) -> bool {
+        self.short.len() * SHORT_ENTRY_BYTES + self.long_bytes_used + self.arena.len() * 4
+            > self.budget.saturating_add(self.max_encoding * 4)
+    }
+
+    /// Wipe every cache back to empty, keeping allocations. The front keys
+    /// must go too: their values are slices of the truncated arena.
+    #[cold]
+    #[inline(never)]
+    fn wipe(&mut self) {
+        self.arena.clear();
+        self.front_keys.fill(0);
+        self.short.clear();
+        self.long.clear();
+        self.long_bytes_used = 0;
     }
 }
 
@@ -1330,7 +1390,8 @@ impl SentencePieceBPE {
                 let (offset, len) = unsafe { *state.front_vals.get_unchecked(front_idx) };
                 let start = offset as usize;
                 // SAFETY: entries are recorded right after appending `len`
-                // tokens at `offset`; `arena` never shrinks.
+                // tokens at `offset`; the arena only clears in a budget
+                // wipe, which also zeroes every front key.
                 f(unsafe { state.arena.get_unchecked(start..start + len as usize) });
                 return;
             }
@@ -1347,13 +1408,18 @@ impl SentencePieceBPE {
             }
             let start = offset as usize;
             // SAFETY: every cached (offset, len) was recorded right after
-            // appending those `len` tokens at `offset`, and `arena` never
-            // shrinks, so the range is always in bounds.
+            // appending those `len` tokens at `offset`; the arena only
+            // clears in a budget wipe, which also clears both maps.
             f(unsafe { state.arena.get_unchecked(start..start + len as usize) });
             return;
         }
 
-        // Miss: character init → ranked merge, then record in the arena.
+        // Miss: budget check first (the lookups above already missed, and
+        // stay misses against the freshly wiped caches), then character
+        // init → ranked merge, then record in the arena.
+        if state.over_budget() {
+            state.wipe();
+        }
         state.symbols.clear();
         if virtual_prefix {
             state.symbols.extend_from_slice(&self.space_init);
@@ -1367,6 +1433,7 @@ impl SentencePieceBPE {
         let offset = state.arena.len() as u32;
         let len = state.symbols.len() as u32;
         state.arena.extend_from_slice(&state.symbols);
+        state.max_encoding = state.max_encoding.max(len as usize);
         match packed {
             Some(key) => {
                 state.short.insert(key, (offset, len));
@@ -1379,6 +1446,7 @@ impl SentencePieceBPE {
                 } else {
                     unit.into()
                 };
+                state.long_bytes_used += key.len() + LONG_ENTRY_BYTES;
                 state.long.insert(key, (offset, len));
             }
         }
@@ -1481,5 +1549,69 @@ mod tests {
         assert_eq!(collapse_space_runs("a \t  b", "▁"), "a \t▁b");
         assert_eq!(collapse_space_runs("  ", "▁"), "▁");
         assert_eq!(collapse_space_runs("no runs", "▁"), "no runs");
+    }
+
+    /// PARITY + BOUNDS: a budgeted EncodeState that wipes mid-corpus must
+    /// produce the exact token stream of an unbounded one, while the
+    /// estimated footprint of the growing caches stays within the budget
+    /// (plus the documented giant-encoding slack).
+    #[test]
+    fn budgeted_wipe_matches_unbounded() {
+        let Some(path) = crate::test_hub::hf_tokenizer_json("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+        else {
+            eprintln!("Skipping: TinyLlama tokenizer.json not in the HF cache");
+            return;
+        };
+        let model = crate::load_tokenizer::hf::load_hf_sentencepiece(&path).unwrap();
+        assert_eq!(
+            model.max_cache_bytes(),
+            Some(super::super::Tokenizer::DEFAULT_MAX_CACHE_BYTES)
+        );
+
+        // ~100k distinct short words plus interleaved > 15-byte words (the
+        // long-map path) and repeats of a common head.
+        let mut text = String::new();
+        let mut x = 0x1234_5678_9ABC_DEF0u64;
+        let mut rand = |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % m
+        };
+        for i in 0..100_000u32 {
+            let len = if i % 17 == 0 { 16 + rand(24) } else { 3 + rand(8) };
+            for _ in 0..len {
+                text.push((b'a' + rand(26) as u8) as char);
+            }
+            text.push(' ');
+            if i % 5 == 0 {
+                text.push_str("the quick brown fox ");
+            }
+        }
+
+        let mut unbounded = EncodeState::with_budget(None);
+        let mut expected = Vec::new();
+        model.encode_raw_with(&mut unbounded, &text, &mut expected);
+
+        // 25 MiB total = ~1 MiB effective past the 24 MiB front cache:
+        // several wipes over ~100k distinct units.
+        let mut budgeted = EncodeState::with_budget(Some(25 << 20));
+        let mut actual = Vec::new();
+        model.encode_raw_with(&mut budgeted, &text, &mut actual);
+        assert_eq!(actual, expected, "budgeted output diverged");
+        assert!(budgeted.long_bytes_used > 0, "corpus never hit the long map");
+        // Both saw ~100k distinct units, so a small survivor count proves
+        // wipes happened, and the estimate must end up within budget.
+        assert!(
+            budgeted.cache_size() < unbounded.cache_size() / 3,
+            "survivors {} vs unbounded {}",
+            budgeted.cache_size(),
+            unbounded.cache_size()
+        );
+        let used = budgeted.short.len() * SHORT_ENTRY_BYTES
+            + budgeted.long_bytes_used
+            + budgeted.arena.len() * 4;
+        let limit = budgeted.budget + budgeted.max_encoding * 4;
+        assert!(used <= limit + 4096, "estimate {used} exceeds budget {limit}");
     }
 }

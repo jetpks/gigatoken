@@ -7,6 +7,7 @@ require "tmpdir"
 RSpec.describe Gigatoken::Tokenizer do
   fixture_path = File.expand_path("../../tests/fixtures/gpt2_tokenizer.json", __dir__)
   fixture = File.binread(fixture_path)
+  ranks_path = File.expand_path("../fixtures/ranks.tiktoken", __dir__)
 
   let(:tokenizer) { described_class.from_file(fixture_path) }
 
@@ -65,6 +66,30 @@ RSpec.describe Gigatoken::Tokenizer do
     expect { Gigatoken::Tokenizer.from_json("not json") }.to raise_error(Gigatoken::Error)
   end
 
+  describe ".from_tiktoken" do
+    it "requires a pretokenizer keyword" do
+      expect { described_class.from_tiktoken(ranks_path) }.to raise_error(ArgumentError)
+    end
+
+    it "resolves each shipped pretokenizer scheme" do
+      %w[gpt2 gpt4 qwen2 qwen35 olmo3 deepseek_v3 o200k nemotron kimi].each do |scheme|
+        expect(described_class.from_tiktoken(ranks_path, pretokenizer: scheme)).to be_a(described_class)
+      end
+    end
+
+    it "raises Gigatoken::Error naming the scheme and the valid ones for an unknown pretokenizer" do
+      expect { described_class.from_tiktoken(ranks_path, pretokenizer: "not_a_scheme") }
+        .to raise_error(Gigatoken::Error, /not_a_scheme/)
+    end
+
+    it "reports caller-supplied special tokens and round-trips them through encode/decode" do
+      tokenizer = described_class.from_tiktoken(ranks_path, pretokenizer: "gpt2", special_tokens: {"<|endoftext|>" => 300})
+      expect(tokenizer.special_tokens).to eq({"<|endoftext|>" => 300})
+      expect(tokenizer.encode("<|endoftext|>")).to eq([300])
+      expect(tokenizer.decode([300]).force_encoding(Encoding::UTF_8)).to eq("<|endoftext|>")
+    end
+  end
+
   describe ".load" do
     it "dispatches an existing tokenizer.json path to from_file" do
       tokenizer = described_class.load(fixture_path)
@@ -79,15 +104,13 @@ RSpec.describe Gigatoken::Tokenizer do
       end
     end
 
-    it "dispatches a .tiktoken path to from_tiktoken" do
-      Dir.mktmpdir do |dir|
-        path = File.join(dir, "vocab.tiktoken")
-        ranks = Array.new(256) { |byte| "#{[byte.chr].pack("m0")} #{byte}" }.join("\n")
-        File.write(path, ranks)
+    it "dispatches a .tiktoken path to from_tiktoken, given a pretokenizer" do
+      tokenizer = described_class.load(ranks_path, pretokenizer: "gpt2", special_tokens: {"<|endoftext|>" => 256})
+      expect(tokenizer.vocab_size).to eq(257) # 256 bytes + <|endoftext|>
+    end
 
-        tokenizer = described_class.load(path)
-        expect(tokenizer.vocab_size).to eq(257) # 256 bytes + <|endoftext|>
-      end
+    it "raises Gigatoken::Error for a .tiktoken path with no pretokenizer, naming the valid schemes" do
+      expect { described_class.load(ranks_path) }.to raise_error(Gigatoken::Error, /pretokenizer/)
     end
 
     it "dispatches a repo-id-shaped string to from_hub, via an injected Hub" do

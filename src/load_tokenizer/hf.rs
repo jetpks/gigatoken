@@ -413,6 +413,7 @@ fn build_sentencepiece(tj: &TokenizerJson) -> Result<SentencePieceBPE> {
         split_safe: Vec::new(),
         cross_pieces: Vec::new(),
         cross_prev: [0; 4],
+        max_cache_bytes: Some(crate::bpe::Tokenizer::DEFAULT_MAX_CACHE_BYTES),
     };
     model.norm_added_tokens = norm_added_tokens
         .into_iter()

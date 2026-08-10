@@ -3,9 +3,11 @@
 //! submodule per feature: Python<->Rust bridging shared by the bindings
 //! (bridge), the FileSource/BytesSource classes (sources), BPE training (train), padded
 //! compat-API encoding (padding), the compat layers' special-token scanner
-//! (matcher), and the pretokenizer helpers (pretokenize).
+//! (matcher), the pretokenizer helpers (pretokenize), and the
+//! process-global cache-budget knob (cache).
 
 pub(crate) mod bridge;
+pub(crate) mod cache;
 pub(crate) mod hub;
 pub(crate) mod matcher;
 pub(crate) mod padding;

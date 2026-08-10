@@ -178,11 +178,42 @@ impl ShortPretokenCache {
     /// 3/4 load. Either way the table is constructed exactly once, at the
     /// max of the two requirements.
     pub(crate) fn with_at_least(n: usize, min_slots: usize) -> Self {
+        Self::with_pow2_capacity(Self::required_capacity(n, min_slots))
+    }
+
+    /// The slot count [`Self::with_at_least`] would allocate for `n`
+    /// entries starting from `min_slots`, without allocating anything.
+    pub(crate) fn required_capacity(n: usize, min_slots: usize) -> usize {
         let mut cap = min_slots.max(1 << 16).next_power_of_two();
         while (n + 1) * 4 > cap * 3 {
             cap *= 2;
         }
-        Self::with_pow2_capacity(cap)
+        cap
+    }
+
+    /// Zero every slot in place (all-zero == all-empty), keeping the
+    /// allocation — the generational-wipe path. Like [`Self::insert`]'s
+    /// grow, this logically invalidates any outstanding [`ProbeView`].
+    pub(crate) fn clear(&mut self) {
+        // SAFETY: the allocation holds exactly `cap` entries.
+        unsafe { std::ptr::write_bytes(self.slots.ptr.as_ptr(), 0, self.slots.cap) };
+        self.len = 0;
+    }
+
+    /// Reset to an empty table of exactly `cap` slots (power of two,
+    /// >= 2), reusing the current allocation when the capacity matches.
+    pub(crate) fn reset_to_capacity(&mut self, cap: usize) {
+        debug_assert!(cap.is_power_of_two() && cap >= 2);
+        if cap == self.slots.cap {
+            self.clear();
+            return;
+        }
+        // Drop the old table (via a 2-slot placeholder) before building
+        // the new one, so two full-size tables never coexist.
+        self.slots = Slots::new_zeroed(2);
+        self.slots = Slots::new_zeroed(cap);
+        self.mask = cap - 1;
+        self.len = 0;
     }
 
     /// Address of `h`'s home pair; both slots share the addressed line.

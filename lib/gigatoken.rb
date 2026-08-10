@@ -7,6 +7,20 @@ module Gigatoken
   # extension — never a raw Rust panic across the Ruby boundary.
   class Error < StandardError; end
 
+  class << self
+    # The process-global encode-cache budget in bytes per worker (a parallel
+    # batch encode may use up to workers x budget), applied to tokenizers of
+    # either backend constructed *afterward* — changing it never affects an
+    # already-built Tokenizer. nil means unbounded. Default: 512 MiB.
+    def max_cache_bytes
+      Native.get_max_cache_bytes
+    end
+
+    def max_cache_bytes=(bytes)
+      Native.set_max_cache_bytes(bytes)
+    end
+  end
+
   NATIVE_EXTENSIONS = %w[.bundle .so .rb].freeze
 
   # Precompiled native gems ship per-ABI subdirs (`gigatoken/4.0/...`),
