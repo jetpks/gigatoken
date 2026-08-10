@@ -36,6 +36,27 @@
   loader rejects non-dense ranks — so both entry points raise
   `Gigatoken::Error` explaining that, rather than `load` falling through to
   the Hub for a name that looks like a legacy repo id.
+- Add `--pretokenizer` to the `bench` and `validate` CLI commands, making the
+  `.tiktoken` shape their `TOKENIZER` argument has always advertised actually
+  usable: a `.tiktoken` file carries mergeable ranks only, so the split regex
+  has to come from the caller, same as `Tokenizer.load` already requires.
+  Without the option, a `.tiktoken` `TOKENIZER` now raises `Gigatoken::Error`
+  naming the valid schemes instead of crashing; the option is accepted but
+  ignored for every other `TOKENIZER` shape.
+- Vendor `o200k_harmony` — no new file: it reuses `o200k_base.tiktoken`'s
+  ranks and `o200k` pretokenizer scheme verbatim, differing only in its
+  special-token table (10 named control tokens plus 1081 reserved slots,
+  transcribed from `openai_public.py`; see
+  `lib/gigatoken/encodings/PROVENANCE.md`). It's the one packaged encoding
+  not checked against `tiktoken_ruby`: that gem's 0.0.17 harmony table drops
+  `<|endofprompt|>` where `openai/tiktoken` 0.9.0 keeps it at id 200018, so
+  the oracle is the outlier here — `spec/gigatoken/differential_spec.rb`
+  proves harmony instead by reduction to `o200k_base` plus a pinned
+  special-token table. `p50k_edit` now raises the same explanatory
+  `Gigatoken::Error` as `p50k_base`: it loads the identical non-dense
+  `p50k_base.tiktoken` ranks and is blocked for the identical reason, rather
+  than falling through to the Hub for a name that looks like a legacy repo
+  id.
 - Add `spec/gigatoken/differential_spec.rb`, proving each packaged encoding
   byte-identical to `tiktoken_ruby` over this repo's own source and docs
   (`lib/**/*.rb`, `spec/**/*.rb`, `src/**/*.rs`, `README.md`,

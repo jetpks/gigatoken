@@ -63,15 +63,15 @@ SentencePiece-BPE models (Llama, Gemma, Mistral — any `tokenizer.json` with `b
 
 ### Packaged tiktoken encodings
 
-`r50k_base`, `cl100k_base`, and `o200k_base` are vendored directly — mergeable ranks, pretokenizer scheme, and special-token table all shipped inside the gem (`lib/gigatoken/encodings/`; see `PROVENANCE.md` there for exact source URLs and hashes) — so both entry points resolve them by name entirely offline: no network access, no writable cache directory.
+`r50k_base`, `cl100k_base`, `o200k_base`, and `o200k_harmony` are vendored directly — mergeable ranks, pretokenizer scheme, and special-token table all shipped inside the gem (`lib/gigatoken/encodings/`; see `PROVENANCE.md` there for exact source URLs and hashes) — so all four resolve by name through both entry points entirely offline: no network access, no writable cache directory. `o200k_harmony` vendors no new file at all: it reuses `o200k_base.tiktoken`'s ranks and the `o200k` scheme verbatim, differing only in its special-token table (10 named control tokens — `<|start|>`, `<|message|>`, `<|end|>`, `<|return|>`, and so on — plus 1081 reserved slots; see `PROVENANCE.md` for the exact table). It's also the one packaged encoding not checked against `tiktoken_ruby`: that gem's 0.0.17 harmony table drops `<|endofprompt|>` where `openai/tiktoken` 0.9.0 keeps it at id 200018, so the oracle is the outlier here — `spec/gigatoken/differential_spec.rb` proves harmony instead by reduction to `o200k_base` plus a pinned special-token table.
 
 ```ruby
 Gigatoken::Tokenizer.from_encoding("cl100k_base")
 Gigatoken::Tokenizer.load("cl100k_base")          # same result — packaged names are
-                                                   # checked before the Hub-repo-id shape
+                                                  # checked before the Hub-repo-id shape
 ```
 
-`p50k_base` is deliberately not packaged: its ranks are not dense (id 50256 is left free for `<|endoftext|>`), and the rank loader rejects non-dense ranks. Both entry points raise `Gigatoken::Error` explaining that, rather than `load` falling through to the Hub for a name that happens to look like a legacy repo id.
+`p50k_base` and `p50k_edit` are deliberately not packaged: both load the same non-dense ranks (id 50256 is left free for `<|endoftext|>`), and the rank loader rejects non-dense ranks. Both entry points raise `Gigatoken::Error` explaining that, rather than `load` falling through to the Hub for a name that happens to look like a legacy repo id.
 
 `encode` on a packaged tokenizer honours its special-token table: text containing `<|endoftext|>` (or any other literal special-token string) is tokenized as that special token, not as ordinary text. That matches [`tiktoken`](https://github.com/openai/tiktoken)'s `encode_with_special_tokens`, not its plain `encode`, which treats the same literal as ordinary text — a difference worth knowing if you're tokenizing untrusted input. To get tiktoken's non-honouring default instead, build a tokenizer from the same rank file with an empty special-token table:
 
@@ -129,6 +129,14 @@ gigatoken validate openai-community/gpt2 owt_train.txt --doc-separator "<|endoft
 ```
 
 `bench` reports MB/s and Mtok/s (`--packed` for the fused packed path, `--no-parallel` for the serial core). `validate` confirms native split-and-encode agrees with a Ruby-side split through `encode_batch`.
+
+TOKENIZER also takes a bare `.tiktoken` file, which is where `--pretokenizer` comes in: the file carries mergeable ranks only, so the split regex has to come from the caller, same as `from_tiktoken` above. `--pretokenizer` takes one of the scheme names listed above for `pretokenizer:`:
+
+```bash
+gigatoken bench lib/gigatoken/encodings/cl100k_base.tiktoken README.md --pretokenizer gpt4
+```
+
+Leave it off against a `.tiktoken` TOKENIZER and both commands raise `Gigatoken::Error` naming the valid schemes instead of crashing; for every other TOKENIZER shape (`tokenizer.json`, a packaged name, a Hub repo id) `--pretokenizer` is accepted but ignored.
 
 ## Development
 
