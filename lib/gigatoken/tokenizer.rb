@@ -35,6 +35,18 @@ module Gigatoken
       new(native, special_tokens: special_tokens)
     end
 
+    # Load one of the tiktoken encodings gigatoken vendors ranks for, by
+    # name — see Gigatoken::Encodings::NAMES — entirely from the vendored
+    # files: no network, no writable cache.
+    def self.from_encoding(name)
+      encoding = Encodings[name]
+      return from_tiktoken(encoding[:rank_file], pretokenizer: encoding[:pretokenizer], special_tokens: encoding[:special_tokens]) if encoding
+
+      reason = Encodings.unpackable_reason(name)
+      detail = reason ? " — #{reason}" : ""
+      raise Error, "#{name.inspect}: not a packaged encoding#{detail} (packaged encodings: #{Encodings::NAMES.join(", ")})"
+    end
+
     # Load tokenizer.json from HuggingFace Hub repo `repo_id` at `revision`
     # (downloaded directly; huggingface_hub is not required).
     def self.from_hub(repo_id, revision: "main", hub: Hub.new)
@@ -43,10 +55,14 @@ module Gigatoken
 
     # Load from any of the supported source shapes: an existing file or
     # directory path (a tokenizer.json, or a directory containing one), a
-    # .tiktoken vocabulary file, or a HuggingFace Hub repo id like
-    # "openai-community/gpt2". A .tiktoken file carries no pretokenizer
-    # scheme of its own, so one must be named explicitly via `pretokenizer:`
-    # — nothing here is guessed.
+    # .tiktoken vocabulary file, a packaged encoding name (see
+    # Gigatoken::Encodings::NAMES, e.g. "cl100k_base"), or a HuggingFace Hub
+    # repo id like "openai-community/gpt2". A .tiktoken file carries no
+    # pretokenizer scheme of its own, so one must be named explicitly via
+    # `pretokenizer:` — nothing here is guessed. Packaged encoding names are
+    # checked before the Hub-repo-id shape: a bare name like "o200k_base" is
+    # also shaped like a legacy repo id, and must resolve locally rather
+    # than reach the network.
     def self.load(source, pretokenizer: nil, special_tokens: {}, revision: "main", hub: Hub.new)
       source = source.to_s
       if source.end_with?(".tiktoken")
@@ -57,6 +73,7 @@ module Gigatoken
         return from_tiktoken(source, pretokenizer: pretokenizer, special_tokens: special_tokens)
       end
       return from_file(source) if File.exist?(source)
+      return from_encoding(source) if Encodings::NAMES.include?(source)
       return from_hub(source, revision: revision, hub: hub) if Hub.looks_like_repo_id?(source)
 
       raise Error, "#{source.inspect}: no such file or directory, not a .tiktoken path, and doesn't look like a HuggingFace Hub repo id"
