@@ -19,7 +19,18 @@ RSpec.describe "packaged encodings against tiktoken_ruby" do
     expect(corpus.sum(&:bytesize)).to be >= 1_000_000
   end
 
-  Gigatoken::Encodings::NAMES.each do |name|
+  # o200k_harmony is excluded here and proven separately, below, by
+  # reduction plus pinning rather than against tiktoken_ruby: tiktoken_ruby
+  # 0.0.17's own o200k_harmony table drops "<|endofprompt|>" (it encodes
+  # the literal as six ordinary-text tokens, not [200018]) while treating
+  # "<|reserved_200018|>" as the sole literal at that id — measured live
+  # against this gem's tiktoken_ruby dependency. openai/tiktoken 0.9.0
+  # keeps both keys at id 200018, because Python dict construction
+  # preserves both; openai/tiktoken is authoritative here, and
+  # tiktoken_ruby is the outlier (see PROVENANCE.md). Comparing harmony
+  # against tiktoken_ruby would fail on tiktoken_ruby's defect, not
+  # gigatoken's — do not restore that comparison to "fix" this.
+  (Gigatoken::Encodings::NAMES - ["o200k_harmony"]).each do |name|
     describe name do
       entry = Gigatoken::Encodings[name]
       oracle = Tiktoken.get_encoding(name)
@@ -33,6 +44,41 @@ RSpec.describe "packaged encodings against tiktoken_ruby" do
         plain = Gigatoken::Tokenizer.from_tiktoken(entry[:rank_file], pretokenizer: entry[:pretokenizer], special_tokens: {})
         corpus.each { |text| expect(plain.encode(text)).to eq(oracle.encode(text)) }
       end
+    end
+  end
+
+  # o200k_harmony has no correct oracle to check against (see above), so it
+  # is proven two other ways: by reduction to o200k_base, which already
+  # carries the tiktoken_ruby proof above for the ranks and split regex
+  # harmony reuses verbatim; and by pinning the special-token table harmony
+  # adds on top, transcribed from openai/tiktoken 0.9.0 (PROVENANCE.md).
+  describe "o200k_harmony" do
+    harmony = Gigatoken::Tokenizer.from_encoding("o200k_harmony")
+    base = Gigatoken::Tokenizer.from_encoding("o200k_base")
+    added_literals = Gigatoken::Encodings["o200k_harmony"][:special_tokens].keys -
+      Gigatoken::Encodings["o200k_base"][:special_tokens].keys
+
+    it "reduces to o200k_base for corpus files containing none of harmony's added special literals" do
+      comparable = corpus_paths.zip(corpus).reject { |_path, text| added_literals.any? { |literal| text.include?(literal) } }
+      expect(comparable.size).to be >= 50
+
+      comparable.each { |_path, text| expect(harmony.encode(text)).to eq(base.encode(text)) }
+    end
+
+    it "pins the special-token table's shape" do
+      special = Gigatoken::Encodings["o200k_harmony"][:special_tokens]
+      expect(special.size).to eq(1091)
+      expect(special.values_at(
+        "<|startoftext|>", "<|endoftext|>", "<|return|>", "<|constrain|>", "<|channel|>",
+        "<|start|>", "<|end|>", "<|message|>", "<|call|>", "<|endofprompt|>"
+      )).to eq([199998, 199999, 200002, 200003, 200005, 200006, 200007, 200008, 200012, 200018])
+      expect(special["<|endofprompt|>"]).to eq(200018)
+      expect(special["<|reserved_200018|>"]).to eq(200018)
+    end
+
+    it "round-trips a real harmony control sequence" do
+      expect(harmony.encode("<|start|>system<|message|>hi<|end|><|return|>"))
+        .to eq([200006, 17360, 200008, 3686, 200007, 200002])
     end
   end
 end

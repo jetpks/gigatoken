@@ -117,6 +117,10 @@ RSpec.describe Gigatoken::Tokenizer do
     it "explains p50k_base's non-dense ranks rather than only that it is unpackaged" do
       expect { described_class.from_encoding("p50k_base") }.to raise_error(Gigatoken::Error, /dense/i)
     end
+
+    it "explains p50k_edit's non-dense ranks rather than only that it is unpackaged" do
+      expect { described_class.from_encoding("p50k_edit") }.to raise_error(Gigatoken::Error, /dense/i)
+    end
   end
 
   describe ".load" do
@@ -202,6 +206,36 @@ RSpec.describe Gigatoken::Tokenizer do
 
       expect { described_class.load("p50k_base", hub: hub) }.to raise_error(Gigatoken::Error, /dense/i)
       expect(hub_reached).to be(false)
+    end
+
+    it "explains p50k_edit's non-dense ranks rather than reaching the Hub" do
+      hub_reached = false
+      hub = Object.new
+      hub.define_singleton_method(:hub_file) do |*|
+        hub_reached = true
+        raise "HUB_REACHED"
+      end
+
+      expect { described_class.load("p50k_edit", hub: hub) }.to raise_error(Gigatoken::Error, /dense/i)
+      expect(hub_reached).to be(false)
+    end
+
+    it "resolves o200k_harmony through both entry points with a read-only HF_HOME and no Hub calls, vendoring no new file" do
+      Dir.mktmpdir do |dir|
+        ro_home = File.join(dir, "ro")
+        Dir.mkdir(ro_home)
+        File.chmod(0o555, ro_home)
+        original_home = ENV["HF_HOME"]
+        ENV["HF_HOME"] = ro_home
+
+        hub = Object.new
+        hub.define_singleton_method(:hub_file) { |*| raise "NETWORK REACHED" }
+
+        expect(described_class.from_encoding("o200k_harmony").vocab_size).to eq(201088)
+        expect(described_class.load("o200k_harmony", hub: hub).vocab_size).to eq(201088)
+      ensure
+        ENV["HF_HOME"] = original_home
+      end
     end
 
     it "resolves every packaged encoding through both entry points with a read-only HF_HOME and no Hub calls" do

@@ -65,7 +65,42 @@ values (`src/pretokenize/options.rs`).
 
 `p50k_base` is deliberately absent: its ranks are not dense (50256 is left free
 for `<|endoftext|>`), and the rank loader rejects non-dense ranks with
-`"ranks must be dense"`.
+`"ranks must be dense"`. `p50k_edit` loads the same `p50k_base.tiktoken` ranks
+and is absent for the identical reason.
+
+## `o200k_harmony`
+
+Packaged with **no new vendored file**: it reuses `o200k_base.tiktoken`'s
+mergeable ranks and the `o200k` pretokenizer scheme verbatim. Confirmed
+against `openai/tiktoken` 0.9.0 that `o200k_harmony()` in `openai_public.py`
+calls `mergeable_ranks` with the same rank file and uses the same `pat_str` as
+`o200k_base()` — only the special-token table differs.
+
+That table (1091 entries: 10 named control tokens, 1081
+`<|reserved_N|>` slots) is transcribed, not derived, from `o200k_harmony()`:
+base specials `<|endoftext|>` 199999 and `<|endofprompt|>` 200018, then
+`<|startoftext|>` 199998, `<|endoftext|>` 199999, `<|reserved_200000|>`
+200000, `<|reserved_200001|>` 200001, `<|return|>` 200002, `<|constrain|>`
+200003, `<|reserved_200004|>` 200004, `<|channel|>` 200005, `<|start|>`
+200006, `<|end|>` 200007, `<|message|>` 200008, `<|reserved_200009|>` 200009,
+`<|reserved_200010|>` 200010, `<|reserved_200011|>` 200011, `<|call|>`
+200012, then `<|reserved_N|>` for `N` in `200013..201087`. The reserved range
+is **not** contiguous from 200000 — the named control tokens sit inside
+200000..200012, leaving reserved slots only at `{200000, 200001, 200004,
+200009, 200010, 200011} ∪ [200013, 201087]`. A table built as "200000..201087
+minus the named ids" invents `<|reserved_200002|>` and drops
+`<|reserved_200018|>`; the transcription above avoids both.
+
+**Not verified against `tiktoken_ruby`** (unlike the three encodings above):
+`tiktoken_ruby` 0.0.17's own `o200k_harmony` table drops `<|endofprompt|>` —
+it encodes the literal as six ordinary-text tokens rather than `[200018]` —
+while treating `<|reserved_200018|>` as the sole literal at that id.
+`openai/tiktoken` 0.9.0 keeps both `<|endofprompt|>` and
+`<|reserved_200018|>`, at the same id, as Python dict construction preserves
+both keys. `openai/tiktoken` is authoritative here; `tiktoken_ruby` is the
+outlier. See `spec/gigatoken/differential_spec.rb` for the measurement and
+the reduction-plus-pinning proof used in place of a `tiktoken_ruby`
+comparison.
 
 ## Licence
 
