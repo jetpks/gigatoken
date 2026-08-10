@@ -15,12 +15,12 @@ module Gigatoken
 
       class << self
         # Load TOKENIZER: a tokenizer.json path/directory, a packaged
-        # tiktoken encoding name, or a HuggingFace repo id — see
-        # Gigatoken::Tokenizer.load. A bare .tiktoken path is not a usable
-        # shape here: it requires a `pretokenizer:` keyword, which this call
-        # site has no way to take.
-        def load_tokenizer(spec)
-          Gigatoken::Tokenizer.load(spec)
+        # tiktoken encoding name, a HuggingFace repo id, or a .tiktoken file
+        # — see Gigatoken::Tokenizer.load. `pretokenizer:` is forwarded
+        # as-is; it's required for a bare .tiktoken path (which carries no
+        # scheme of its own) and ignored for the other shapes.
+        def load_tokenizer(spec, pretokenizer: nil)
+          Gigatoken::Tokenizer.load(spec, pretokenizer: pretokenizer)
         end
 
         # Parse a decimal byte size like "100MB", "2.5GB", or "1000000";

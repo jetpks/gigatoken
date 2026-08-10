@@ -13,13 +13,14 @@ module Gigatoken
     class Validate < Dry::CLI::Command
       desc "Check that encode_files agrees with a Ruby-side split plus encode_batch on FILES"
 
-      argument :tokenizer, required: true, desc: "tokenizer.json path or directory, HuggingFace repo id, or .tiktoken file"
+      argument :tokenizer, required: true, desc: "tokenizer.json path or directory, packaged encoding name (e.g. \"cl100k_base\"), HuggingFace repo id, or .tiktoken file (requires --pretokenizer)"
       argument :files, type: :array, required: true, desc: "UTF-8 text files to encode"
 
       option :doc_separator, desc: 'document separator to split the files on, e.g. "<|endoftext|>"; whole files are single documents otherwise'
+      option :pretokenizer, desc: "pretokenizer scheme, required when TOKENIZER is a .tiktoken file (one of #{Native.pretokenizer_names.join(", ")}); ignored otherwise"
 
-      def call(tokenizer:, files:, doc_separator: nil, **)
-        gt_tokenizer = Support.load_tokenizer(tokenizer)
+      def call(tokenizer:, files:, doc_separator: nil, pretokenizer: nil, **)
+        gt_tokenizer = Support.load_tokenizer(tokenizer, pretokenizer: pretokenizer)
 
         via_files = gt_tokenizer.encode_files(Support.text_file_source(files, doc_separator))
         via_batch = gt_tokenizer.encode_batch(Support.split_docs(files, doc_separator))
