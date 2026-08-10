@@ -62,7 +62,11 @@ module Gigatoken
     # `pretokenizer:` — nothing here is guessed. Packaged encoding names are
     # checked before the Hub-repo-id shape: a bare name like "o200k_base" is
     # also shaped like a legacy repo id, and must resolve locally rather
-    # than reach the network.
+    # than reach the network. Names the registry knows but doesn't package
+    # (see Encodings.unpackable_reason, e.g. "p50k_base") are intercepted
+    # here too, raising the same explanation from_encoding gives rather than
+    # reaching the Hub — but only those; an unrecognized bare name like
+    # "gpt2" still dispatches to the Hub.
     def self.load(source, pretokenizer: nil, special_tokens: {}, revision: "main", hub: Hub.new)
       source = source.to_s
       if source.end_with?(".tiktoken")
@@ -73,7 +77,7 @@ module Gigatoken
         return from_tiktoken(source, pretokenizer: pretokenizer, special_tokens: special_tokens)
       end
       return from_file(source) if File.exist?(source)
-      return from_encoding(source) if Encodings::NAMES.include?(source)
+      return from_encoding(source) if Encodings::NAMES.include?(source) || Encodings.unpackable_reason(source)
       return from_hub(source, revision: revision, hub: hub) if Hub.looks_like_repo_id?(source)
 
       raise Error, "#{source.inspect}: no such file or directory, not a .tiktoken path, and doesn't look like a HuggingFace Hub repo id"

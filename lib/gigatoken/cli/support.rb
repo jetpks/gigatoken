@@ -14,8 +14,11 @@ module Gigatoken
       private_constant :SIZE_PATTERN
 
       class << self
-        # Load TOKENIZER: a tokenizer.json path/directory, a HuggingFace
-        # repo id, or a .tiktoken file — see Gigatoken::Tokenizer.load.
+        # Load TOKENIZER: a tokenizer.json path/directory, a packaged
+        # tiktoken encoding name, or a HuggingFace repo id — see
+        # Gigatoken::Tokenizer.load. A bare .tiktoken path is not a usable
+        # shape here: it requires a `pretokenizer:` keyword, which this call
+        # site has no way to take.
         def load_tokenizer(spec)
           Gigatoken::Tokenizer.load(spec)
         end

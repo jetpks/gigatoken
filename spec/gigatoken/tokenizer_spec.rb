@@ -192,6 +192,18 @@ RSpec.describe Gigatoken::Tokenizer do
       expect(hub_reached).to be(true)
     end
 
+    it "explains p50k_base's non-dense ranks rather than reaching the Hub" do
+      hub_reached = false
+      hub = Object.new
+      hub.define_singleton_method(:hub_file) do |*|
+        hub_reached = true
+        raise "HUB_REACHED"
+      end
+
+      expect { described_class.load("p50k_base", hub: hub) }.to raise_error(Gigatoken::Error, /dense/i)
+      expect(hub_reached).to be(false)
+    end
+
     it "resolves every packaged encoding through both entry points with a read-only HF_HOME and no Hub calls" do
       Dir.mktmpdir do |dir|
         ro_home = File.join(dir, "ro")
