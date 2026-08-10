@@ -90,6 +90,35 @@ RSpec.describe Gigatoken::Tokenizer do
     end
   end
 
+  describe ".from_encoding" do
+    it "resolves each packaged encoding by name with its full vocab_size" do
+      {"r50k_base" => 50257, "cl100k_base" => 100277, "o200k_base" => 200019}.each do |name, vocab_size|
+        expect(described_class.from_encoding(name).vocab_size).to eq(vocab_size)
+      end
+    end
+
+    it "reproduces pinned token ids for each packaged encoding" do
+      {
+        "r50k_base" => {"hello world" => [31373, 995], "日本語 tokens" => [33768, 98, 17312, 105, 45739, 252, 16326]},
+        "cl100k_base" => {"hello world" => [15339, 1917], "日本語 tokens" => [9080, 22656, 45918, 252, 11460]},
+        "o200k_base" => {"hello world" => [24912, 2375], "日本語 tokens" => [9048, 40909, 20290]}
+      }.each do |name, cases|
+        tokenizer = described_class.from_encoding(name)
+        cases.each { |text, ids| expect(tokenizer.encode(text)).to eq(ids) }
+      end
+    end
+
+    it "raises Gigatoken::Error naming the bad input and the packaged encodings" do
+      expect { described_class.from_encoding("not_an_encoding") }.to raise_error(Gigatoken::Error) do |error|
+        expect(error.message).to include("not_an_encoding", "r50k_base", "cl100k_base", "o200k_base")
+      end
+    end
+
+    it "explains p50k_base's non-dense ranks rather than only that it is unpackaged" do
+      expect { described_class.from_encoding("p50k_base") }.to raise_error(Gigatoken::Error, /dense/i)
+    end
+  end
+
   describe ".load" do
     it "dispatches an existing tokenizer.json path to from_file" do
       tokenizer = described_class.load(fixture_path)
@@ -131,6 +160,56 @@ RSpec.describe Gigatoken::Tokenizer do
 
     it "raises Gigatoken::Error for garbage input" do
       expect { described_class.load("../not a real path/nor a repo id") }.to raise_error(Gigatoken::Error)
+    end
+
+    it "dispatches each packaged encoding name to from_encoding, including the full special-token table" do
+      {
+        "r50k_base" => [50257, {"<|endoftext|>" => 50256}],
+        "cl100k_base" => [100277, {
+          "<|endoftext|>" => 100257,
+          "<|fim_prefix|>" => 100258,
+          "<|fim_middle|>" => 100259,
+          "<|fim_suffix|>" => 100260,
+          "<|endofprompt|>" => 100276
+        }],
+        "o200k_base" => [200019, {"<|endoftext|>" => 199999, "<|endofprompt|>" => 200018}]
+      }.each do |name, (vocab_size, special_tokens)|
+        tokenizer = described_class.load(name)
+        expect(tokenizer.vocab_size).to eq(vocab_size)
+        expect(tokenizer.special_tokens).to eq(special_tokens)
+      end
+    end
+
+    it "still dispatches a bare legacy repo id like gpt2 to the Hub rather than the packaged registry" do
+      hub_reached = false
+      hub = Object.new
+      hub.define_singleton_method(:hub_file) do |*|
+        hub_reached = true
+        raise "HUB_REACHED"
+      end
+
+      expect { described_class.load("gpt2", hub: hub) }.to raise_error("HUB_REACHED")
+      expect(hub_reached).to be(true)
+    end
+
+    it "resolves every packaged encoding through both entry points with a read-only HF_HOME and no Hub calls" do
+      Dir.mktmpdir do |dir|
+        ro_home = File.join(dir, "ro")
+        Dir.mkdir(ro_home)
+        File.chmod(0o555, ro_home)
+        original_home = ENV["HF_HOME"]
+        ENV["HF_HOME"] = ro_home
+
+        hub = Object.new
+        hub.define_singleton_method(:hub_file) { |*| raise "NETWORK REACHED" }
+
+        %w[r50k_base cl100k_base o200k_base].each do |name|
+          expect(described_class.from_encoding(name)).to be_a(described_class)
+          expect(described_class.load(name, hub: hub)).to be_a(described_class)
+        end
+      ensure
+        ENV["HF_HOME"] = original_home
+      end
     end
   end
 

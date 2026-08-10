@@ -40,4 +40,5 @@ require native
 
 require_relative "gigatoken/hub"
 require_relative "gigatoken/packed_result"
+require_relative "gigatoken/encodings"
 require_relative "gigatoken/tokenizer"
