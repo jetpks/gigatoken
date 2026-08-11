@@ -32,6 +32,14 @@
   subprocess: the old failure killed the interpreter, so an in-process
   regression test would take the suite down with it instead of reporting.
 
+  Benchmarked on a 16-core arm64 box, interleaved A/B over four rounds with an
+  A/A control establishing a ~1% noise floor: single encodes are neutral at
+  medium sizes (-0.4%) and measurably faster on large inputs (-9%), with the
+  batch path inside its (wide) noise band. An earlier revision of this change
+  cost 2-5% on short and medium encodes — not lock overhead, but the contended
+  path enlarging `encode` enough to flip an inlining decision under
+  `lto = "fat"`. It is `#[cold]`-outlined for that reason; keep it that way.
+
 ## [0.2.0] - 2026-08-10
 
 - Merge upstream through [fac0114](https://github.com/marcelroed/gigatoken/commit/fac0114), including the encode-cache bound (upstream issue [#36](https://github.com/marcelroed/gigatoken/issues/36)) and the `from_tiktoken` pretokenizer/special-tokens rework ([#42](https://github.com/marcelroed/gigatoken/pull/42)).
