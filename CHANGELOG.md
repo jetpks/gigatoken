@@ -32,21 +32,24 @@
   subprocess: the old failure killed the interpreter, so an in-process
   regression test would take the suite down with it instead of reporting.
 
-  Benchmarked on a 16-core arm64 box, interleaved A/B over four rounds with an
-  A/A control establishing a ~1% noise floor: single encodes are neutral at
-  medium sizes (-0.4%) and measurably faster on large inputs (-9%), with the
-  batch path inside its (wide) noise band. An earlier revision of this change
-  cost 2-5% on short and medium encodes — not lock overhead, but the contended
-  path enlarging `encode` enough to flip an inlining decision under
-  `lto = "fat"`. It is `#[cold]`-outlined for that reason; keep it that way.
+  On single `#encode`, this change is **neutral within what we can measure**.
+  The reproducible harness is `bench/encode_ab.rb`
+  (`ruby -Ilib bench/encode_ab.rb`); the numbers, the machines and the method
+  are in `docs/rb/benchmarks.md` under "0.2.1 thread-safety benchmark".
 
-  The single-`#encode` A/B harness behind those numbers is
-  `bench/encode_ab.rb` (`ruby -Ilib bench/encode_ab.rb`); its methodology,
-  the counterfactual (attributes removed) run, and this repo's own measured
-  numbers live in `docs/rb/benchmarks.md` under "0.2.1 thread-safety
-  benchmark". `spec/gigatoken/concurrency_spec.rb` now also drives a
-  SentencePiece tokenizer (`spec/fixtures/sp_tokenizer.json`) from multiple
-  threads on one shared instance, alongside the existing BPE coverage.
+  Read that section before quoting a figure from it. Only the **medium** size
+  resolves anything on the hardware measured so far: there the noise floor is
+  ~0.5-1% and outlining is worth about 1%. At short and large sizes the
+  harness's own arm-against-itself spread is several percent — at large it has
+  reported deltas from -4% to -13% comparing one build to *itself* — so no
+  single-digit result at those sizes means anything yet. An earlier revision of
+  this change measured slower on short and medium encodes, which is why the
+  contended path is `#[cold]`-outlined; that direction is reproducible, the
+  magnitude is not pinned down. Keep it outlined.
+
+  `spec/gigatoken/concurrency_spec.rb` now also drives a SentencePiece
+  tokenizer (`spec/fixtures/sp_tokenizer.json`) from multiple threads on one
+  shared instance, alongside the existing BPE coverage.
 
 ## [0.2.0] - 2026-08-10
 

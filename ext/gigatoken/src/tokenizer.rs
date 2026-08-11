@@ -453,10 +453,17 @@ impl BPETokenizer {
     /// Keeping this out of `encode`'s body is a measured requirement, not
     /// tidiness: the workspace builds with `lto = "fat"`, so the core encode
     /// routine inlines into `encode`, and inlining is sensitive to the caller's
-    /// size. Written inline, this second path cost 2-5% on short and medium
-    /// single encodes against an A/A noise floor of 1% — no lock overhead, just
-    /// a flipped inlining decision. Outlined, `encode`'s hot body is the
-    /// original three lines behind a `try_write`.
+    /// size. Written inline, this second path measured slower on single
+    /// encodes — no lock overhead, just a flipped inlining decision. Outlined,
+    /// `encode`'s hot body is the original three lines behind a `try_write`.
+    ///
+    /// Before you re-inline this "to simplify": rerun the evidence rather than
+    /// trusting a number. `ruby -Ilib bench/encode_ab.rb` with the attributes
+    /// stripped and again with them restored, and read
+    /// `docs/rb/benchmarks.md` first — only the medium size resolves anything
+    /// on the hardware measured so far, where outlining is worth about 1%
+    /// against a ~0.5-1% floor. The short and large sizes are dominated by the
+    /// harness's own spread and cannot settle this either way.
     #[cold]
     #[inline(never)]
     fn encode_contended(&self, input: RString) -> Vec<u32> {

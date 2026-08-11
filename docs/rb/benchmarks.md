@@ -93,11 +93,14 @@ Evidence for the single-`#encode` A/B claim in the [0.2.1] CHANGELOG entry:
 that outlining `encode_contended` (`#[cold] #[inline(never)]`,
 `ext/gigatoken/src/tokenizer.rs`) is what keeps the uncontended `#encode`
 fast path free of an inlining-driven regression under this workspace's
-`lto = "fat"`. Measured 2026-08-11 on a **Mac mini/laptop-class Apple M2
-Max, 12 cores, macOS 26.6.1**, Ruby 4.0.6 — a different, and less powerful,
-machine than the M4 Max box the rest of this file's numbers come from, and
-a shared dev machine with no attempt made to quiesce other processes beyond
-closing other applications.
+`lto = "fat"`. Measured 2026-08-11 on an **Apple M2 Max, 12 cores, macOS
+26.6.1**, Ruby 4.0.6 — a different machine from the M4 Max box the rest of
+this file's numbers come from, and a shared dev machine with no attempt made
+to quiesce other processes beyond closing other applications.
+
+**Read "How much of this can you trust" at the end of this section before
+quoting any figure from it.** The short answer: the medium size resolves to
+about a percent, and the short and large sizes do not resolve at all.
 
 Method: `ruby -Ilib bench/encode_ab.rb` (`GIGATOKEN_AB_ROUNDS=20`, the
 default). Single `#encode` only (never `encode_batch`/`encode_files`) on
@@ -130,14 +133,46 @@ arms (identical code within a run) into one mean per build:
 | medium | 3.215us | 3.245us | 1.02% / 0.46% | +0.93% |
 | large | 282.78us | 289.64us | 10.84% / 12.37% | +2.42% |
 
-On this machine the attributes-present-vs-removed delta at every size is
-smaller than the noise floor measured in the same runs — this machine's
-noise floor is wide enough (0.46%-18.34%) that it cannot resolve the
-CHANGELOG's claimed effect (-9% large, -0.4% medium, +2-5% regression
-un-outlined). That is a limit of this measurement, not a retraction of the
-CHANGELOG's numbers, which were measured on the 16-core box named there.
+At every size the attributes-present-vs-removed delta is smaller than the
+noise floor measured in the same runs. Only the **medium** row is
+informative, because it is the only one whose floor (1.02% / 0.46%) is
+tighter than the effect being looked for: there, removing the attributes
+measured **~1% slower**. That is the same direction as the regression the
+outlining was added to prevent, and about a third of the magnitude first
+reported. The short and large rows resolve nothing.
+
 Reproduce with:
 
 ```
 ruby -Ilib bench/encode_ab.rb
 ```
+
+### How much of this can you trust
+
+Less than the table's precision suggests, and the reason is worth knowing
+before you run this harness again.
+
+Each figure is a **mean** of per-round samples, and the per-round
+distribution is heavily right-skewed on a shared machine: a scheduler
+hiccup makes one sample 2-3x the median, and with 20 rounds a single such
+sample moves that arm's mean by several percent. Arm A absorbs one
+disproportionately often — measured max/median ratios of 2.4x-2.9x for A
+against 1.1x-1.3x for B across three runs.
+
+The consequence, measured directly on this machine by running the harness
+with **the same build in both arms**, at the large size:
+
+| Run (A and B identical) | Mean delta | Median delta | A max/median |
+|---|---|---|---|
+| 1 | -10.29% | +0.54% | 2.87x |
+| 2 | -9.30% | -4.03% | 2.45x |
+| 3 | -6.35% | +1.80% | 2.37x |
+
+Two things follow. First, a large-size reading of a few percent — in either
+direction — is the instrument, not the code; earlier revisions of this
+document claimed a 9% single-encode speedup on large inputs, and the
+harness produces exactly that comparing one build to itself. Second, the
+medians are stable where the means are not, so **read medians** until the
+harness reports them itself. Fixing that is the next thing to do here:
+report median and spread rather than the mean, and the short and large
+sizes may become usable.
