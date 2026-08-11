@@ -460,10 +460,16 @@ impl BPETokenizer {
     /// Before you re-inline this "to simplify": rerun the evidence rather than
     /// trusting a number. `ruby -Ilib bench/encode_ab.rb` with the attributes
     /// stripped and again with them restored, and read
-    /// `docs/rb/benchmarks.md` first — only the medium size resolves anything
-    /// on the hardware measured so far, where outlining is worth about 1%
-    /// against a ~0.5-1% floor. The short and large sizes are dominated by the
-    /// harness's own spread and cannot settle this either way.
+    /// `docs/rb/benchmarks.md` first — no size resolves this on the hardware
+    /// measured so far. The instrument is honest (an interleaved same-build
+    /// run never calls a size faster or slower, at any size) and has power to
+    /// catch a couple-percent effect reliably, but the attributes' real
+    /// effect is small enough that even the tightest floor (medium,
+    /// well under 3%) swallows it more often than not. Removing the
+    /// attributes measures slower at medium and large, in the direction the
+    /// outlining was added to prevent, but neither delta clears the noise
+    /// floor. Keep it outlined on that direction and on the original
+    /// inline-regression measurement, not on a pinned-down magnitude.
     #[cold]
     #[inline(never)]
     fn encode_contended(&self, input: RString) -> Vec<u32> {
