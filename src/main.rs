@@ -73,8 +73,12 @@ pub fn main() {
             .unwrap()
             .join("data/tokenizers/r50k_base.tiktoken")
     });
-    let mut r50k =
-        load_tokenizer::tiktoken::load_tiktoken(&r50k_path).expect("Failed to load r50k tokenizer");
+    let mut r50k = load_tokenizer::tiktoken::load_tiktoken(
+        &r50k_path,
+        pretokenize::PretokenizerType::GPT2,
+        vec![("<|endoftext|>".to_string(), 50256)],
+    )
+    .expect("Failed to load r50k tokenizer");
     eprintln!("Loaded r50k: {:?}", r50k);
 
     // Encode with r50k (GPT-2 style: pretokenize + memoized BPE)

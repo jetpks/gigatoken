@@ -7,9 +7,6 @@ module Gigatoken
   # over a native `Gigatoken::Native::BPETokenizer` or
   # `Gigatoken::Native::SentencePieceTokenizer`.
   class Tokenizer
-    TIKTOKEN_ENDOFTEXT = "<|endoftext|>"
-    private_constant :TIKTOKEN_ENDOFTEXT
-
     FILE_SOURCE_CLASSES = [Native::TextFileSource, Native::JsonlFileSource, Native::ParquetFileSource].freeze
     private_constant :FILE_SOURCE_CLASSES
 
@@ -27,10 +24,27 @@ module Gigatoken
       from_json(File.binread(path))
     end
 
-    # Load from a .tiktoken mergeable-ranks file.
-    def self.from_tiktoken(path)
-      native = Native::BPETokenizer.from_tiktoken(path.to_s)
-      new(native, special_tokens: {TIKTOKEN_ENDOFTEXT => native.vocab_size - 1})
+    # Load from a .tiktoken mergeable-ranks file. The file carries neither a
+    # pretokenization scheme nor special tokens — nothing is guessed here,
+    # so `pretokenizer:` is required: one of the schemes gigatoken ships
+    # (see Native.pretokenizer_names, e.g. "gpt2"/"r50k", "gpt4"/"cl100k",
+    # "o200k", "qwen2", "qwen35", "olmo3", "deepseek_v3", "nemotron", "kimi").
+    # `special_tokens:` maps token content to id (none by default).
+    def self.from_tiktoken(path, pretokenizer:, special_tokens: {})
+      native = Native::BPETokenizer.from_tiktoken(path.to_s, pretokenizer, special_tokens)
+      new(native, special_tokens: special_tokens)
+    end
+
+    # Load one of the tiktoken encodings gigatoken vendors ranks for, by
+    # name — see Gigatoken::Encodings::NAMES — entirely from the vendored
+    # files: no network, no writable cache.
+    def self.from_encoding(name)
+      encoding = Encodings[name]
+      return from_tiktoken(encoding[:rank_file], pretokenizer: encoding[:pretokenizer], special_tokens: encoding[:special_tokens]) if encoding
+
+      reason = Encodings.unpackable_reason(name)
+      detail = reason ? " — #{reason}" : ""
+      raise Error, "#{name.inspect}: not a packaged encoding#{detail} (packaged encodings: #{Encodings::NAMES.join(", ")})"
     end
 
     # Load tokenizer.json from HuggingFace Hub repo `repo_id` at `revision`
@@ -41,12 +55,29 @@ module Gigatoken
 
     # Load from any of the supported source shapes: an existing file or
     # directory path (a tokenizer.json, or a directory containing one), a
-    # .tiktoken vocabulary file, or a HuggingFace Hub repo id like
-    # "openai-community/gpt2".
-    def self.load(source, revision: "main", hub: Hub.new)
+    # .tiktoken vocabulary file, a packaged encoding name (see
+    # Gigatoken::Encodings::NAMES, e.g. "cl100k_base"), or a HuggingFace Hub
+    # repo id like "openai-community/gpt2". A .tiktoken file carries no
+    # pretokenizer scheme of its own, so one must be named explicitly via
+    # `pretokenizer:` — nothing here is guessed. Packaged encoding names are
+    # checked before the Hub-repo-id shape: a bare name like "o200k_base" is
+    # also shaped like a legacy repo id, and must resolve locally rather
+    # than reach the network. Names the registry knows but doesn't package
+    # (see Encodings.unpackable_reason, e.g. "p50k_base") are intercepted
+    # here too, raising the same explanation from_encoding gives rather than
+    # reaching the Hub — but only those; an unrecognized bare name like
+    # "gpt2" still dispatches to the Hub.
+    def self.load(source, pretokenizer: nil, special_tokens: {}, revision: "main", hub: Hub.new)
       source = source.to_s
-      return from_tiktoken(source) if source.end_with?(".tiktoken")
+      if source.end_with?(".tiktoken")
+        unless pretokenizer
+          raise Error, "#{source.inspect}: a .tiktoken file carries no pretokenizer scheme of its own — " \
+            "pass pretokenizer: (one of #{Native.pretokenizer_names.join(", ")})"
+        end
+        return from_tiktoken(source, pretokenizer: pretokenizer, special_tokens: special_tokens)
+      end
       return from_file(source) if File.exist?(source)
+      return from_encoding(source) if Encodings::NAMES.include?(source) || Encodings.unpackable_reason(source)
       return from_hub(source, revision: revision, hub: hub) if Hub.looks_like_repo_id?(source)
 
       raise Error, "#{source.inspect}: no such file or directory, not a .tiktoken path, and doesn't look like a HuggingFace Hub repo id"
@@ -110,6 +141,12 @@ module Gigatoken
 
     def merges
       @native.merges
+    end
+
+    # Cached pretoken/unit entries on this tokenizer's single-document
+    # encode path — see Gigatoken.max_cache_bytes.
+    def cache_entries
+      @native.cache_entries
     end
 
     attr_reader :special_tokens

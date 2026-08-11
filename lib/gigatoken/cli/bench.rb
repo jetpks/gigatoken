@@ -10,19 +10,20 @@ module Gigatoken
     class Bench < Dry::CLI::Command
       desc "Measure the time to encode FILES with TOKENIZER"
 
-      argument :tokenizer, required: true, desc: "tokenizer.json path or directory, HuggingFace repo id, or .tiktoken file"
+      argument :tokenizer, required: true, desc: "tokenizer.json path or directory, packaged encoding name (e.g. \"cl100k_base\"), HuggingFace repo id, or .tiktoken file (requires --pretokenizer)"
       argument :files, type: :array, required: true, desc: "UTF-8 text files to encode"
 
       option :doc_separator, desc: 'document separator to split the files on, e.g. "<|endoftext|>"; whole files are single documents otherwise'
       option :limit_bytes, default: "none", desc: "cap the bytes benchmarked, e.g. 100MB; 'none' for everything (parallel mode only — ignored with --no-parallel)"
       option :parallel, type: :boolean, default: true, desc: "encode on the worker pool instead of the fused serial core path"
       option :packed, type: :boolean, default: false, desc: "time the fused native file path with a packed IO::Buffer result instead of per-document Ruby arrays (ignores --limit-bytes)"
+      option :pretokenizer, desc: "pretokenizer scheme, required when TOKENIZER is a .tiktoken file (one of #{Native.pretokenizer_names.join(", ")}); ignored otherwise"
 
-      def call(tokenizer:, files:, doc_separator: nil, limit_bytes: "none", parallel: true, packed: false, **)
+      def call(tokenizer:, files:, doc_separator: nil, limit_bytes: "none", parallel: true, packed: false, pretokenizer: nil, **)
         limit = Support.parse_size(limit_bytes)
         out.puts "#{label("cpu")}: #{Support.cpu_info}"
 
-        gt_tokenizer = Support.load_tokenizer(tokenizer)
+        gt_tokenizer = Support.load_tokenizer(tokenizer, pretokenizer: pretokenizer)
 
         start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         if packed

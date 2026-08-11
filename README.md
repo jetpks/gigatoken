@@ -48,16 +48,49 @@ tok.vocab_size                          # => 50257
 tok.special_tokens                      # => {"<|endoftext|>" => 50256}
 ```
 
-`load` takes a `tokenizer.json` path, a directory holding one, a HuggingFace Hub repo id, or a `.tiktoken` mergeable-ranks file, and dispatches on shape. Hub downloads run over socketry's `async-http` — no Python anywhere. Know what you have? Skip the dispatch:
+`load` takes a `tokenizer.json` path, a directory holding one, a packaged tiktoken encoding name (`r50k_base`, `cl100k_base`, `o200k_base`), a HuggingFace Hub repo id, or a `.tiktoken` mergeable-ranks file, and dispatches on shape. Hub downloads run over socketry's `async-http` — no Python anywhere. Know what you have? Skip the dispatch:
 
 ```ruby
 Gigatoken::Tokenizer.from_file("tokenizer.json")
 Gigatoken::Tokenizer.from_hub("openai-community/gpt2", revision: "main")
-Gigatoken::Tokenizer.from_tiktoken("vocab.tiktoken")
+Gigatoken::Tokenizer.from_tiktoken("cl100k_base.tiktoken", pretokenizer: "gpt4", special_tokens: {"<|endoftext|>" => 100257})
 Gigatoken::Tokenizer.from_json(File.binread("tokenizer.json"))
 ```
 
+A `.tiktoken` file holds mergeable ranks only — its pretokenization scheme and special tokens live in the code that defines the encoding, not the file — so `pretokenizer:` is a required keyword (one of `Gigatoken::Native.pretokenizer_names`: `gpt2`/`r50k`, `gpt4`/`cl100k`, `qwen2`, `qwen35`, `olmo3`, `deepseek_v3`, `o200k`, `nemotron`, `kimi`) and `special_tokens:` defaults to none. Nothing is guessed: an unknown scheme raises `Gigatoken::Error` naming the valid ones, and `Tokenizer.load` on a `.tiktoken` path with no `pretokenizer:` raises rather than silently picking one.
+
 SentencePiece-BPE models (Llama, Gemma, Mistral — any `tokenizer.json` with `byte_fallback: true`) load through the same entry points and pick the right backend automatically. One difference: the SentencePiece core decodes text, so it validates input and raises `Gigatoken::Error` on invalid UTF-8 instead of guessing.
+
+### Packaged tiktoken encodings
+
+`r50k_base`, `cl100k_base`, `o200k_base`, and `o200k_harmony` are vendored directly — mergeable ranks, pretokenizer scheme, and special-token table all shipped inside the gem (`lib/gigatoken/encodings/`; see `PROVENANCE.md` there for exact source URLs and hashes) — so all four resolve by name through both entry points entirely offline: no network access, no writable cache directory. `o200k_harmony` vendors no new file at all: it reuses `o200k_base.tiktoken`'s ranks and the `o200k` scheme verbatim, differing only in its special-token table (10 named control tokens — `<|start|>`, `<|message|>`, `<|end|>`, `<|return|>`, and so on — plus 1081 reserved slots; see `PROVENANCE.md` for the exact table). It's also the one packaged encoding not checked against `tiktoken_ruby`: that gem's 0.0.17 harmony table drops `<|endofprompt|>` where `openai/tiktoken` 0.9.0 keeps it at id 200018, so the oracle is the outlier here — `spec/gigatoken/differential_spec.rb` proves harmony instead by reduction to `o200k_base` plus a pinned special-token table.
+
+```ruby
+Gigatoken::Tokenizer.from_encoding("cl100k_base")
+Gigatoken::Tokenizer.load("cl100k_base")          # same result — packaged names are
+                                                  # checked before the Hub-repo-id shape
+```
+
+`p50k_base` and `p50k_edit` are deliberately not packaged: both load the same non-dense ranks (id 50256 is left free for `<|endoftext|>`), and the rank loader rejects non-dense ranks. Both entry points raise `Gigatoken::Error` explaining that, rather than `load` falling through to the Hub for a name that happens to look like a legacy repo id.
+
+`encode` on a packaged tokenizer honours its special-token table: text containing `<|endoftext|>` (or any other literal special-token string) is tokenized as that special token, not as ordinary text. That matches [`tiktoken`](https://github.com/openai/tiktoken)'s `encode_with_special_tokens`, not its plain `encode`, which treats the same literal as ordinary text — a difference worth knowing if you're tokenizing untrusted input. To get tiktoken's non-honouring default instead, build a tokenizer from the same rank file with an empty special-token table:
+
+```ruby
+entry = Gigatoken::Encodings["cl100k_base"]
+Gigatoken::Tokenizer.from_tiktoken(entry[:rank_file], pretokenizer: entry[:pretokenizer], special_tokens: {})
+```
+
+### Encode-cache budget
+
+Each tokenizer's pretoken cache is capped process-globally (512 MiB per worker by default) so long-lived processes — a Rails worker, say — don't grow it unbounded; a full cache wipes back toward its seed level and refills, which costs a bit of re-computation but never changes encode output. Tune it before building tokenizers you want the new budget to apply to:
+
+```ruby
+Gigatoken.max_cache_bytes            # => 536870912 (512 MiB)
+Gigatoken.max_cache_bytes = 64 << 20 # only tokenizers built after this see the new budget
+Gigatoken.max_cache_bytes = nil      # unbounded
+
+tok.cache_entries                    # => cached pretoken/unit count right now
+```
 
 ### Tokenize files without leaving Rust
 
@@ -96,6 +129,14 @@ gigatoken validate openai-community/gpt2 owt_train.txt --doc-separator "<|endoft
 ```
 
 `bench` reports MB/s and Mtok/s (`--packed` for the fused packed path, `--no-parallel` for the serial core). `validate` confirms native split-and-encode agrees with a Ruby-side split through `encode_batch`.
+
+TOKENIZER also takes a bare `.tiktoken` file, which is where `--pretokenizer` comes in: the file carries mergeable ranks only, so the split regex has to come from the caller, same as `from_tiktoken` above. `--pretokenizer` takes one of the scheme names listed above for `pretokenizer:`:
+
+```bash
+gigatoken bench lib/gigatoken/encodings/cl100k_base.tiktoken README.md --pretokenizer gpt4
+```
+
+Leave it off against a `.tiktoken` TOKENIZER and both commands raise `Gigatoken::Error` naming the valid schemes instead of crashing; for every other TOKENIZER shape (`tokenizer.json`, a packaged name, a Hub repo id) `--pretokenizer` is accepted but ignored.
 
 ## Development
 

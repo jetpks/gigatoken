@@ -9,6 +9,7 @@ use std::os::raw::c_long;
 
 use gigatoken_rs::load_tokenizer::hf::HfTokenizer;
 use gigatoken_rs::load_tokenizer::{hf, tiktoken};
+use gigatoken_rs::pretokenize::PretokenizerType;
 use gigatoken_rs::{
     GatherBuf, GatherOutcome, Tokenizer, WorkerPool, encode_docs_into, encode_docs_ragged,
     encode_files_docs, encode_files_docs_serial,
@@ -359,7 +360,7 @@ pub struct BPETokenizer {
 impl BPETokenizer {
     pub(crate) fn from_tokenizer(tokenizer: Tokenizer) -> Self {
         Self {
-            tokenizer: RefCell::new(tokenizer),
+            tokenizer: RefCell::new(crate::cache::apply_max_cache_bytes(tokenizer)),
             workers: WorkerPool::new(),
         }
     }
@@ -379,8 +380,28 @@ impl BPETokenizer {
         }
     }
 
-    fn from_tiktoken(ruby: &Ruby, path: String) -> Result<Self, Error> {
-        match tiktoken::load_tiktoken(&path) {
+    /// Load from a .tiktoken rank file with the named pretokenizer scheme
+    /// and a {content => id} mapping of special tokens. The file carries
+    /// neither, so both are the caller's to supply — see
+    /// `Gigatoken::Tokenizer.from_tiktoken`, which knows them for the
+    /// encodings OpenAI publishes.
+    fn from_tiktoken(
+        ruby: &Ruby,
+        path: String,
+        pretokenizer: String,
+        special_tokens: HashMap<String, u32>,
+    ) -> Result<Self, Error> {
+        let scheme = PretokenizerType::from_name(&pretokenizer).ok_or_else(|| {
+            raise(
+                ruby,
+                format!(
+                    "unknown pretokenizer scheme {pretokenizer:?}; expected one of {}",
+                    PretokenizerType::NAMES.join(", ")
+                ),
+            )
+        })?;
+        let special_tokens: Vec<(String, u32)> = special_tokens.into_iter().collect();
+        match tiktoken::load_tiktoken(&path, scheme, special_tokens) {
             Ok(tokenizer) => Ok(Self::from_tokenizer(tokenizer)),
             Err(e) => Err(raise(ruby, e.to_string())),
         }
@@ -552,12 +573,19 @@ impl BPETokenizer {
         }
         Ok(result)
     }
+
+    /// Cached pretoken entries on this tokenizer: grows as text is encoded,
+    /// drops back toward vocab-seed level when a budgeted cache wipes (see
+    /// `Gigatoken.max_cache_bytes`).
+    fn cache_entries(&self) -> usize {
+        self.tokenizer.borrow().cache_entries()
+    }
 }
 
 pub fn init(ruby: &Ruby, native: RModule) -> Result<(), Error> {
     let class: RClass = native.define_class("BPETokenizer", ruby.class_object())?;
     class.define_singleton_method("from_hf_json", function!(BPETokenizer::from_hf_json, 1))?;
-    class.define_singleton_method("from_tiktoken", function!(BPETokenizer::from_tiktoken, 1))?;
+    class.define_singleton_method("from_tiktoken", function!(BPETokenizer::from_tiktoken, 3))?;
     class.define_method("encode", method!(BPETokenizer::encode, 1))?;
     class.define_method("encode_batch", method!(BPETokenizer::encode_batch, 1))?;
     class.define_method("encode_batch_packed", method!(BPETokenizer::encode_batch_packed, 1))?;
@@ -567,5 +595,6 @@ pub fn init(ruby: &Ruby, native: RModule) -> Result<(), Error> {
     class.define_method("vocab_size", method!(BPETokenizer::vocab_size, 0))?;
     class.define_method("vocab", method!(BPETokenizer::vocab, 0))?;
     class.define_method("merges", method!(BPETokenizer::merges, 0))?;
+    class.define_method("cache_entries", method!(BPETokenizer::cache_entries, 0))?;
     Ok(())
 }

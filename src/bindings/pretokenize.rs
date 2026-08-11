@@ -29,6 +29,17 @@ impl PretokenizerIter {
     }
 }
 
+/// The pretokenization scheme a loader was given by name, for the sources
+/// whose format carries no split regex (tiktoken rank files).
+pub(crate) fn pretokenizer_scheme(name: &str) -> PyResult<pretokenize::PretokenizerType> {
+    pretokenize::PretokenizerType::from_name(name).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown pretokenizer scheme {name:?}; expected one of {}",
+            pretokenize::PretokenizerType::NAMES.join(", ")
+        ))
+    })
+}
+
 #[pyfunction]
 pub(crate) fn pretokenizer<'py>(text: Bound<'py, PyBytes>) -> PyResult<PretokenizerIter> {
     Ok(PretokenizerIter {

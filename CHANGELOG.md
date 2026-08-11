@@ -1,5 +1,73 @@
 # Changelog
 
+## [0.2.0] - 2026-08-10
+
+- Merge upstream through [fac0114](https://github.com/marcelroed/gigatoken/commit/fac0114), including the encode-cache bound (upstream issue [#36](https://github.com/marcelroed/gigatoken/issues/36)) and the `from_tiktoken` pretokenizer/special-tokens rework ([#42](https://github.com/marcelroed/gigatoken/pull/42)).
+- **Breaking:** `Gigatoken::Tokenizer.from_tiktoken` no longer guesses a
+  pretokenization scheme. A `.tiktoken` rank file carries mergeable ranks
+  only — the split regex and special tokens live in the code that defines
+  the encoding — so `pretokenizer:` is now a required keyword and
+  `special_tokens:` defaults to none, instead of silently applying the r50k
+  scheme and a lone `<|endoftext|>` to every file (wrong ids, no error, for
+  anything but `r50k_base`):
+
+  ```ruby
+  # before
+  Gigatoken::Tokenizer.from_tiktoken("cl100k_base.tiktoken")
+
+  # after
+  Gigatoken::Tokenizer.from_tiktoken("cl100k_base.tiktoken", pretokenizer: "gpt4",
+    special_tokens: {"<|endoftext|>" => 100257})
+  ```
+
+  `Tokenizer.load` on a `.tiktoken` path now raises unless `pretokenizer:` is
+  given, for the same reason.
+- Add `Gigatoken.max_cache_bytes` (getter/setter, default 512 MiB, `nil` for
+  unbounded) and `Tokenizer#cache_entries`, exposing the core's process-global
+  encode-cache budget to Ruby.
+- Vendor mergeable ranks for the `r50k_base`, `cl100k_base`, and `o200k_base`
+  tiktoken encodings (see `lib/gigatoken/encodings/PROVENANCE.md` for exact
+  hashes and source URLs) and add `Gigatoken::Tokenizer.from_encoding`, so
+  they resolve by name with no network access and no writable cache
+  directory. `Tokenizer.load` dispatches packaged names the same way, ahead
+  of the HuggingFace-Hub-repo-id shape a bare name like `cl100k_base` would
+  otherwise also match. `p50k_base` is deliberately not packaged — its ranks
+  are not dense (id 50256 is left free for `<|endoftext|>`) and the rank
+  loader rejects non-dense ranks — so both entry points raise
+  `Gigatoken::Error` explaining that, rather than `load` falling through to
+  the Hub for a name that looks like a legacy repo id.
+- Add `--pretokenizer` to the `bench` and `validate` CLI commands, making the
+  `.tiktoken` shape their `TOKENIZER` argument has always advertised actually
+  usable: a `.tiktoken` file carries mergeable ranks only, so the split regex
+  has to come from the caller, same as `Tokenizer.load` already requires.
+  Without the option, a `.tiktoken` `TOKENIZER` now raises `Gigatoken::Error`
+  naming the valid schemes instead of crashing; the option is accepted but
+  ignored for every other `TOKENIZER` shape.
+- Vendor `o200k_harmony` — no new file: it reuses `o200k_base.tiktoken`'s
+  ranks and `o200k` pretokenizer scheme verbatim, differing only in its
+  special-token table (10 named control tokens plus 1081 reserved slots,
+  transcribed from `openai_public.py`; see
+  `lib/gigatoken/encodings/PROVENANCE.md`). It's the one packaged encoding
+  not checked against `tiktoken_ruby`: that gem's 0.0.17 harmony table drops
+  `<|endofprompt|>` where `openai/tiktoken` 0.9.0 keeps it at id 200018, so
+  the oracle is the outlier here — `spec/gigatoken/differential_spec.rb`
+  proves harmony instead by reduction to `o200k_base` plus a pinned
+  special-token table. `p50k_edit` now raises the same explanatory
+  `Gigatoken::Error` as `p50k_base`: it loads the identical non-dense
+  `p50k_base.tiktoken` ranks and is blocked for the identical reason, rather
+  than falling through to the Hub for a name that looks like a legacy repo
+  id.
+- Add `spec/gigatoken/differential_spec.rb`, proving each packaged encoding
+  byte-identical to `tiktoken_ruby` over this repo's own source and docs
+  (`lib/**/*.rb`, `spec/**/*.rb`, `src/**/*.rs`, `README.md`,
+  `CHANGELOG.md`): the packaged tokenizer against `encode_with_special_tokens`,
+  and the same rank file loaded with `special_tokens: {}` against plain
+  `encode` — two directions, because gigatoken always honours an encoding's
+  special tokens and tiktoken's default `encode` does not, so a one-sided
+  comparison can't tell a correct encoder from one checked against the wrong
+  oracle method. `tiktoken_ruby` is a development dependency only
+  (`Gemfile`), not a runtime one.
+
 ## [0.1.1] - 2026-07-24
 
 - Remove a hidden memcpy in the core's `Committer::finish`: under mimalloc

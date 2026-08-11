@@ -14,10 +14,13 @@ module Gigatoken
       private_constant :SIZE_PATTERN
 
       class << self
-        # Load TOKENIZER: a tokenizer.json path/directory, a HuggingFace
-        # repo id, or a .tiktoken file — see Gigatoken::Tokenizer.load.
-        def load_tokenizer(spec)
-          Gigatoken::Tokenizer.load(spec)
+        # Load TOKENIZER: a tokenizer.json path/directory, a packaged
+        # tiktoken encoding name, a HuggingFace repo id, or a .tiktoken file
+        # — see Gigatoken::Tokenizer.load. `pretokenizer:` is forwarded
+        # as-is; it's required for a bare .tiktoken path (which carries no
+        # scheme of its own) and ignored for the other shapes.
+        def load_tokenizer(spec, pretokenizer: nil)
+          Gigatoken::Tokenizer.load(spec, pretokenizer: pretokenizer)
         end
 
         # Parse a decimal byte size like "100MB", "2.5GB", or "1000000";
