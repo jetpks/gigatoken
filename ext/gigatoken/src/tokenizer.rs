@@ -445,6 +445,21 @@ impl BPETokenizer {
             return out;
         }
 
+        self.encode_contended(input)
+    }
+
+    /// The contended half of [`Self::encode`], outlined and `#[cold]`.
+    ///
+    /// Keeping this out of `encode`'s body is a measured requirement, not
+    /// tidiness: the workspace builds with `lto = "fat"`, so the core encode
+    /// routine inlines into `encode`, and inlining is sensitive to the caller's
+    /// size. Written inline, this second path cost 2-5% on short and medium
+    /// single encodes against an A/A noise floor of 1% — no lock overhead, just
+    /// a flipped inlining decision. Outlined, `encode`'s hot body is the
+    /// original three lines behind a `try_write`.
+    #[cold]
+    #[inline(never)]
+    fn encode_contended(&self, input: RString) -> Vec<u32> {
         // SAFETY: copied before any GVL release, so nothing Ruby-owned is
         // captured by the closure below.
         let owned = unsafe { input.as_slice() }.to_vec();
