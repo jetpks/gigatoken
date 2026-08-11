@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.2.1] - 2026-08-10
+
+- **Fix a fatal crash when one tokenizer is shared across threads.** Ruby hands
+  a single instance to every thread, and `#encode` took a mutable borrow of a
+  `RefCell` that the batch paths held shared across a GVL release — so an
+  `encode_batch` (or `encode_files`) racing an `#encode` on the same tokenizer
+  aborted the VM with `RefCell already borrowed (fatal)`. Reachable from safe
+  Ruby with no unsafe usage, and fatal rather than rescuable, so a threaded
+  server (Falcon `--threaded`, Puma, Sidekiq) lost the whole worker.
+
+  `BPETokenizer` now holds its tokenizer in an `RwLock`. Every long hold is a
+  reader — the batch paths keep it across their GVL release, as do `decode`,
+  `vocab`, `merges`, `vocab_size` and `cache_entries` — so readers never
+  exclude each other. The sole writer is `#encode`, which is short.
+
+  `#encode` takes the write guard with `try_write` on the uncontended path, so
+  the common case costs one atomic and never releases the GVL. Only when it
+  actually has to wait on a batch does it copy its input and move the
+  wait-and-encode inside `without_gvl`: blocking there while holding the GVL
+  would stall every other Ruby thread in the VM, and the guard is taken and
+  dropped inside the closure so it never crosses OS threads when the scheduler
+  offloads it.
+
+  `SentencePieceTokenizer`'s model needed no interior mutability at all (every
+  path only reads it) and is now a plain field; its `EncodeState` — the one
+  mutable piece — moves from `RefCell` to `Mutex`, which is also what makes the
+  wrapped object genuinely `Sync`.
+
+  Covered by `spec/gigatoken/concurrency_spec.rb`, which runs each scenario in a
+  subprocess: the old failure killed the interpreter, so an in-process
+  regression test would take the suite down with it instead of reporting.
+
 ## [0.2.0] - 2026-08-10
 
 - Merge upstream through [fac0114](https://github.com/marcelroed/gigatoken/commit/fac0114), including the encode-cache bound (upstream issue [#36](https://github.com/marcelroed/gigatoken/issues/36)) and the `from_tiktoken` pretokenizer/special-tokens rework ([#42](https://github.com/marcelroed/gigatoken/pull/42)).

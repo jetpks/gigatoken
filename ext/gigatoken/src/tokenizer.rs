@@ -3,7 +3,7 @@
 //! the core crate's `src/lib.rs` (the `python` feature), minus the
 //! numpy/awkward-array machinery that has no Ruby analog.
 
-use std::cell::RefCell;
+use std::sync::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::os::raw::c_long;
 
@@ -353,14 +353,14 @@ fn marshal_inputs(inputs: RArray) -> Result<InputDocs, Error> {
 
 #[magnus::wrap(class = "Gigatoken::Native::BPETokenizer", free_immediately, size)]
 pub struct BPETokenizer {
-    tokenizer: RefCell<Tokenizer>,
+    tokenizer: RwLock<Tokenizer>,
     workers: WorkerPool,
 }
 
 impl BPETokenizer {
     pub(crate) fn from_tokenizer(tokenizer: Tokenizer) -> Self {
         Self {
-            tokenizer: RefCell::new(crate::cache::apply_max_cache_bytes(tokenizer)),
+            tokenizer: RwLock::new(crate::cache::apply_max_cache_bytes(tokenizer)),
             workers: WorkerPool::new(),
         }
     }
@@ -407,14 +407,53 @@ impl BPETokenizer {
         }
     }
 
+    /// Shared access to the tokenizer, for everything that only reads it —
+    /// the batch paths, `decode`, `vocab`, `merges`, the size accessors.
+    ///
+    /// Readers never exclude each other, which is what makes the long holds
+    /// safe: `encode_batch`/`encode_files` keep this across a GVL release
+    /// (they run the core pool over `&Tokenizer`), and any other Ruby thread
+    /// reading meanwhile just proceeds. The only exclusive holder is
+    /// [`Self::encode`], which is short.
+    fn read_tokenizer(&self) -> std::sync::RwLockReadGuard<'_, Tokenizer> {
+        self.tokenizer.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Encode one string, mutating the tokenizer's pretoken cache — the only
+    /// exclusive use of the lock.
+    ///
+    /// Uncontended (every single-threaded caller, and the common case under
+    /// threads) this takes the fast path: grab the write guard, encode against
+    /// the Ruby string's own bytes, never release the GVL. Identical cost to
+    /// the pre-lock version plus one uncontended atomic.
+    ///
+    /// Contended, the writer is waiting on a reader that will hold the lock
+    /// for as long as a batch encode takes. Blocking there while holding the
+    /// GVL would stall every other Ruby thread in the VM, so instead the input
+    /// is copied and the whole wait-and-encode moves inside `without_gvl`.
+    /// The copy is what makes that sound: no Ruby `VALUE` and no `RString`
+    /// buffer may outlive the release (see `marshal_inputs`), and the guard is
+    /// taken and dropped inside the closure, so it never crosses OS threads
+    /// even when the scheduler offloads it (see `gvl`).
     fn encode(&self, input: RString) -> Vec<u32> {
-        // SAFETY: read-only, for the duration of this synchronous call.
-        let bytes = unsafe { input.as_slice() };
-        let mut out = Vec::new();
-        self.tokenizer
-            .borrow_mut()
-            .encode_with_added_tokens_flat(bytes, &mut out);
-        out
+        if let Ok(mut tokenizer) = self.tokenizer.try_write() {
+            // SAFETY: read-only, for the duration of this synchronous call,
+            // with no GVL release in between.
+            let bytes = unsafe { input.as_slice() };
+            let mut out = Vec::new();
+            tokenizer.encode_with_added_tokens_flat(bytes, &mut out);
+            return out;
+        }
+
+        // SAFETY: copied before any GVL release, so nothing Ruby-owned is
+        // captured by the closure below.
+        let owned = unsafe { input.as_slice() }.to_vec();
+        without_gvl(move || {
+            let mut tokenizer = self.tokenizer.write().unwrap_or_else(|e| e.into_inner());
+            let mut out = Vec::new();
+            tokenizer.encode_with_added_tokens_flat(&owned, &mut out);
+            out
+        })
     }
 
     /// Encode a batch on the core worker pool, with the GVL released for the
@@ -425,7 +464,7 @@ impl BPETokenizer {
     fn encode_batch_ragged(rb_self: &Self, inputs: RArray) -> Result<(Vec<u32>, Vec<i64>), Error> {
         let marshaled = marshal_inputs(inputs)?;
         let doc_slices = marshaled.as_slices();
-        let tokenizer = rb_self.tokenizer.borrow();
+        let tokenizer = rb_self.read_tokenizer();
         let tokenizer: &Tokenizer = &tokenizer;
         let workers = &rb_self.workers;
         Ok(without_gvl(|| encode_docs_ragged(workers, tokenizer, &doc_slices)))
@@ -474,7 +513,7 @@ impl BPETokenizer {
         // the duration of the gather below (see the allocation above).
         let dest = unsafe { GatherBuf::new(ptr, total_bytes) };
 
-        let tokenizer = rb_self.tokenizer.borrow();
+        let tokenizer = rb_self.read_tokenizer();
         let tokenizer: &Tokenizer = &tokenizer;
         let workers = &rb_self.workers;
         match without_gvl(|| encode_docs_into(workers, tokenizer, &doc_slices, dest)) {
@@ -515,7 +554,7 @@ impl BPETokenizer {
         };
 
         let source = sources::resolve(ruby, source)?;
-        let tokenizer = rb_self.tokenizer.borrow();
+        let tokenizer = rb_self.read_tokenizer();
         let tokenizer: &Tokenizer = &tokenizer;
         let workers = &rb_self.workers;
         let encoded: std::io::Result<(Vec<u32>, Vec<i64>)> = without_gvl(|| {
@@ -547,16 +586,16 @@ impl BPETokenizer {
     fn decode(ruby: &Ruby, rb_self: &Self, tokens: RArray) -> Result<RString, Error> {
         let ids: Vec<u32> = tokens.to_vec()?;
         let ids: Vec<_> = ids.into_iter().map(Into::into).collect();
-        let bytes: Vec<u8> = rb_self.tokenizer.borrow().decode(&ids).collect();
+        let bytes: Vec<u8> = rb_self.read_tokenizer().decode(&ids).collect();
         Ok(binary_string(ruby, &bytes))
     }
 
     fn vocab_size(&self) -> usize {
-        self.tokenizer.borrow().vocab_size()
+        self.read_tokenizer().vocab_size()
     }
 
     fn vocab(ruby: &Ruby, rb_self: &Self) -> Result<RHash, Error> {
-        let tokenizer = rb_self.tokenizer.borrow();
+        let tokenizer = rb_self.read_tokenizer();
         let hash = ruby.hash_new();
         for (id, bytes) in tokenizer.vocab_entries() {
             hash.aset(id, binary_string(ruby, bytes))?;
@@ -565,7 +604,7 @@ impl BPETokenizer {
     }
 
     fn merges(ruby: &Ruby, rb_self: &Self) -> Result<RArray, Error> {
-        let tokenizer = rb_self.tokenizer.borrow();
+        let tokenizer = rb_self.read_tokenizer();
         let entries = tokenizer.merge_entries();
         let result = ruby.ary_new_capa(entries.len());
         for (a, b) in entries {
@@ -578,7 +617,7 @@ impl BPETokenizer {
     /// drops back toward vocab-seed level when a budgeted cache wipes (see
     /// `Gigatoken.max_cache_bytes`).
     fn cache_entries(&self) -> usize {
-        self.tokenizer.borrow().cache_entries()
+        self.read_tokenizer().cache_entries()
     }
 }
 
