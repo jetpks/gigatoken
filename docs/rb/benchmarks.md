@@ -86,3 +86,58 @@ different throughput.
 None of this repeats upstream's own core-engine numbers — those are measured
 independently through the Python package and live at
 [marcelroed/gigatoken#benchmarks](https://github.com/marcelroed/gigatoken#benchmarks).
+
+## 0.2.1 thread-safety benchmark (2026-08-11)
+
+Evidence for the single-`#encode` A/B claim in the [0.2.1] CHANGELOG entry:
+that outlining `encode_contended` (`#[cold] #[inline(never)]`,
+`ext/gigatoken/src/tokenizer.rs`) is what keeps the uncontended `#encode`
+fast path free of an inlining-driven regression under this workspace's
+`lto = "fat"`. Measured 2026-08-11 on a **Mac mini/laptop-class Apple M2
+Max, 12 cores, macOS 26.6.1**, Ruby 4.0.6 — a different, and less powerful,
+machine than the M4 Max box the rest of this file's numbers come from, and
+a shared dev machine with no attempt made to quiesce other processes beyond
+closing other applications.
+
+Method: `ruby -Ilib bench/encode_ab.rb` (`GIGATOKEN_AB_ROUNDS=20`, the
+default). Single `#encode` only (never `encode_batch`/`encode_files`) on
+`cl100k_base`, at three sizes — short (45 B), medium (2,280 B), large
+(228,000 B) — timed as the mean of many calls per round, arms interleaved
+round to round, with an A/A noise floor self-derived from the same
+interleaved run (even- vs odd-round samples of arm A).
+
+`#[cold]`/`#[inline(never)]` are compile-time attributes with no
+Ruby-visible switch, so `bench/encode_ab.rb` itself can only measure
+whatever build is currently installed — both its "A" and "B" arms below ran
+the shipped (attributes-present) build:
+
+| Size | A | B | A/A noise floor | A/B delta |
+|---|---|---|---|---|
+| short | 0.39us | 0.38us | 10.98% | -1.55% (indistinguishable) |
+| medium | 3.20us | 3.14us | 5.94% | -1.91% (indistinguishable) |
+| large | 288.65us | 269.24us | 11.10% | -6.73% (indistinguishable) |
+
+**Counterfactual (attributes removed):** ran once, manually — see
+`bench/encode_ab.rb`'s header comment for the exact procedure (strip
+`#[cold]`/`#[inline(never)]` from `encode_contended` in
+`ext/gigatoken/src/tokenizer.rs`, `bundle exec rake compile`, run the
+harness, then revert and rebuild again). Combining each run's own A and B
+arms (identical code within a run) into one mean per build:
+
+| Size | Attributes present (shipped) | Attributes removed | A/A noise floor (each run) | Delta |
+|---|---|---|---|---|
+| short | 0.395us | 0.380us | 11.76% / 18.34% | -3.80% |
+| medium | 3.215us | 3.245us | 1.02% / 0.46% | +0.93% |
+| large | 282.78us | 289.64us | 10.84% / 12.37% | +2.42% |
+
+On this machine the attributes-present-vs-removed delta at every size is
+smaller than the noise floor measured in the same runs — this machine's
+noise floor is wide enough (0.46%-18.34%) that it cannot resolve the
+CHANGELOG's claimed effect (-9% large, -0.4% medium, +2-5% regression
+un-outlined). That is a limit of this measurement, not a retraction of the
+CHANGELOG's numbers, which were measured on the 16-core box named there.
+Reproduce with:
+
+```
+ruby -Ilib bench/encode_ab.rb
+```
