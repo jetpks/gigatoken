@@ -13,7 +13,7 @@
 //! `Gigatoken::Error` instead of ever calling `str::from_utf8_unchecked` on
 //! Ruby-supplied bytes.
 
-use std::cell::RefCell;
+use std::sync::Mutex;
 
 use gigatoken_rs::input::file_source::DocFormat;
 use gigatoken_rs::{EncodeState, SentencePieceBPE, sp_encode_docs_ragged, sp_encode_files_docs, sp_encode_files_docs_serial};
@@ -35,10 +35,13 @@ fn require_utf8<'a>(ruby: &Ruby, bytes: &'a [u8]) -> Result<&'a str, Error> {
 #[magnus::wrap(class = "Gigatoken::Native::SentencePieceTokenizer", free_immediately, size)]
 pub struct SentencePieceTokenizer {
     // `SentencePieceBPE`'s encode methods take `&self` (only `EncodeState`
-    // is mutated), so this `RefCell` is never `borrow_mut`'d — see the
-    // builder report's DISAGREEMENTS for why it's here anyway.
-    tokenizer: RefCell<SentencePieceBPE>,
-    state: RefCell<EncodeState>,
+    // is mutated), so the model needs no interior mutability at all — every
+    // path here reads it, including the ones that release the GVL.
+    tokenizer: SentencePieceBPE,
+    // The one mutable piece. A `Mutex` rather than a `RefCell` so the wrapped
+    // object is `Sync`: Ruby hands the same instance to every thread, and a
+    // `RefCell` shared that way is unsound (see `BPETokenizer`'s lock).
+    state: Mutex<EncodeState>,
 }
 
 impl SentencePieceTokenizer {
@@ -48,8 +51,8 @@ impl SentencePieceTokenizer {
         let tokenizer = crate::cache::apply_max_cache_bytes_sp(tokenizer);
         let state = EncodeState::with_budget(tokenizer.max_cache_bytes());
         Self {
-            tokenizer: RefCell::new(tokenizer),
-            state: RefCell::new(state),
+            tokenizer,
+            state: Mutex::new(state),
         }
     }
 
@@ -58,8 +61,8 @@ impl SentencePieceTokenizer {
         let bytes = unsafe { input.as_slice() };
         let text = require_utf8(ruby, bytes)?;
         let mut ids: Vec<u32> = Vec::new();
-        let mut state = rb_self.state.borrow_mut();
-        rb_self.tokenizer.borrow().encode_raw_cb(&mut state, text, &mut |tokens| {
+        let mut state = rb_self.state.lock().unwrap_or_else(|e| e.into_inner());
+        rb_self.tokenizer.encode_raw_cb(&mut state, text, &mut |tokens| {
             ids.extend(tokens.iter().map(|&t| u32::from(t)))
         });
         Ok(ids)
@@ -84,8 +87,7 @@ impl SentencePieceTokenizer {
             })
             .collect::<Result<_, _>>()?;
         let doc_refs: Vec<&str> = docs.iter().map(String::as_str).collect();
-        let tokenizer = rb_self.tokenizer.borrow();
-        let tokenizer: &SentencePieceBPE = &tokenizer;
+        let tokenizer: &SentencePieceBPE = &rb_self.tokenizer;
         Ok(without_gvl(|| sp_encode_docs_ragged(tokenizer, &doc_refs)))
     }
 
@@ -130,8 +132,7 @@ impl SentencePieceTokenizer {
             }
         }
 
-        let tokenizer = rb_self.tokenizer.borrow();
-        let tokenizer: &SentencePieceBPE = &tokenizer;
+        let tokenizer: &SentencePieceBPE = &rb_self.tokenizer;
         let encoded: std::io::Result<(Vec<u32>, Vec<i64>)> = without_gvl(|| {
             sources::encode_files_ragged(&source, parallel, |files, format| {
                 for &region in files {
@@ -166,16 +167,16 @@ impl SentencePieceTokenizer {
     fn decode(ruby: &Ruby, rb_self: &Self, tokens: RArray) -> Result<RString, Error> {
         let ids: Vec<u32> = tokens.to_vec()?;
         let ids: Vec<_> = ids.into_iter().map(Into::into).collect();
-        let bytes = rb_self.tokenizer.borrow().decode(&ids);
+        let bytes = rb_self.tokenizer.decode(&ids);
         Ok(binary_string(ruby, &bytes))
     }
 
     fn vocab_size(&self) -> usize {
-        self.tokenizer.borrow().vocab_size()
+        self.tokenizer.vocab_size()
     }
 
     fn vocab(ruby: &Ruby, rb_self: &Self) -> Result<RHash, Error> {
-        let tokenizer = rb_self.tokenizer.borrow();
+        let tokenizer = &rb_self.tokenizer;
         let hash = ruby.hash_new();
         for (id, bytes) in tokenizer.vocab_entries() {
             hash.aset(id, binary_string(ruby, bytes))?;
@@ -184,7 +185,7 @@ impl SentencePieceTokenizer {
     }
 
     fn merges(ruby: &Ruby, rb_self: &Self) -> Result<RArray, Error> {
-        let tokenizer = rb_self.tokenizer.borrow();
+        let tokenizer = &rb_self.tokenizer;
         let entries = tokenizer.merge_entries();
         let result = ruby.ary_new_capa(entries.len());
         for (a, b) in entries {
@@ -196,7 +197,7 @@ impl SentencePieceTokenizer {
     /// Cached unit entries on the single-document `encode` path's state
     /// (batch encoders are per-call); see `BPETokenizer::cache_entries`.
     fn cache_entries(&self) -> usize {
-        self.state.borrow().cache_size()
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).cache_size()
     }
 }
 
