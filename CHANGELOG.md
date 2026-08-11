@@ -37,15 +37,20 @@
   (`ruby -Ilib bench/encode_ab.rb`); the numbers, the machines and the method
   are in `docs/rb/benchmarks.md` under "0.2.1 thread-safety benchmark".
 
-  Read that section before quoting a figure from it. Only the **medium** size
-  resolves anything on the hardware measured so far: there the noise floor is
-  ~0.5-1% and outlining is worth about 1%. At short and large sizes the
-  harness's own arm-against-itself spread is several percent — at large it has
-  reported deltas from -4% to -13% comparing one build to *itself* — so no
-  single-digit result at those sizes means anything yet. An earlier revision of
-  this change measured slower on short and medium encodes, which is why the
-  contended path is `#[cold]`-outlined; that direction is reproducible, the
-  magnitude is not pinned down. Keep it outlined.
+  Read that section before quoting a figure from it. The harness reports a
+  median with a bootstrap-derived noise floor now, not a mean — an earlier
+  revision's mean-based floor was itself the source of an apparent "9%
+  faster" reading that a same-build self-comparison later reproduced with no
+  code difference at all. With the fixed instrument, no size — short,
+  medium, or large — resolves the attributes' effect on this hardware: the
+  same-build noise floor (well under the 3% ceiling at every size) is close
+  enough to the real effect that it swallows it more often than not, and a
+  synthetic check confirms the instrument can resolve a known ~2%+ effect
+  reliably but only catches a known 1% effect a minority of the time. An
+  earlier revision of this change measured slower on short and medium
+  encodes, which is why the contended path is `#[cold]`-outlined; that
+  direction is reproducible, the magnitude is not pinned down by this
+  harness. Keep it outlined.
 
   `spec/gigatoken/concurrency_spec.rb` now also drives a SentencePiece
   tokenizer (`spec/fixtures/sp_tokenizer.json`) from multiple threads on one
