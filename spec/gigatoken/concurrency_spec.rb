@@ -80,4 +80,57 @@ RSpec.describe "concurrent use of a shared tokenizer" do
     expect(out).to include("OK"), "subprocess died: #{out}"
     expect(status).to be_success
   end
+
+  # The SentencePiece half of the fix: `SentencePieceTokenizer`'s model is a
+  # plain field (every path only reads it) and its one mutable piece —
+  # `EncodeState`, the pretoken cache — is a `Mutex` rather than the `RefCell`
+  # it used to be. These two examples are guards, not discriminators: the
+  # architect has confirmed both pass on the pre-0.2.1 tree (a1e7caa) too,
+  # since the SP model was never `borrow_mut`'d there and `state.borrow_mut()`
+  # is only ever reached under the GVL — no SP crash was reachable before this
+  # change. They stay here as regression coverage for the `Mutex` conversion,
+  # not as before/after proof.
+  sp_fixture_path = File.expand_path("../fixtures/sp_tokenizer.json", __dir__)
+
+  let(:sp_preamble) { <<~RUBY }
+    Warning[:experimental] = false
+    require "gigatoken"
+    tok = Gigatoken::Tokenizer.from_file(#{sp_fixture_path.inspect})
+    corpus = ["hello world", "hello", "world", "\u{1F389}", "hello world " * 8]
+  RUBY
+
+  it "survives an SP batch encode racing single encodes on the same instance" do
+    status, out = run_ruby(<<~RUBY)
+      #{sp_preamble}
+      expected = tok.encode(corpus.first)
+      big = corpus * 40
+
+      batcher = Thread.new { 200.times { tok.encode_batch(big) } }
+      singles = Thread.new { 4000.times { raise "wrong" unless tok.encode(corpus.first) == expected } }
+      [batcher, singles].each(&:join)
+      puts "OK"
+    RUBY
+
+    expect(out).to include("OK"), "subprocess died: #{out}"
+    expect(status).to be_success
+  end
+
+  it "returns identical output for the same SP input across many threads" do
+    status, out = run_ruby(<<~RUBY)
+      #{sp_preamble}
+      expected = corpus.map { |s| tok.encode(s) }
+
+      results = 8.times.map do
+        Thread.new { 200.times.flat_map { corpus.map { |s| tok.encode(s) } } }
+      end.map(&:value)
+
+      results.each do |r|
+        r.each_slice(corpus.size) { |slice| raise "mismatch" unless slice == expected }
+      end
+      puts "OK"
+    RUBY
+
+    expect(out).to include("OK"), "subprocess died: #{out}"
+    expect(status).to be_success
+  end
 end

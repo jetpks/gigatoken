@@ -40,6 +40,14 @@
   path enlarging `encode` enough to flip an inlining decision under
   `lto = "fat"`. It is `#[cold]`-outlined for that reason; keep it that way.
 
+  The single-`#encode` A/B harness behind those numbers is
+  `bench/encode_ab.rb` (`ruby -Ilib bench/encode_ab.rb`); its methodology,
+  the counterfactual (attributes removed) run, and this repo's own measured
+  numbers live in `docs/rb/benchmarks.md` under "0.2.1 thread-safety
+  benchmark". `spec/gigatoken/concurrency_spec.rb` now also drives a
+  SentencePiece tokenizer (`spec/fixtures/sp_tokenizer.json`) from multiple
+  threads on one shared instance, alongside the existing BPE coverage.
+
 ## [0.2.0] - 2026-08-10
 
 - Merge upstream through [fac0114](https://github.com/marcelroed/gigatoken/commit/fac0114), including the encode-cache bound (upstream issue [#36](https://github.com/marcelroed/gigatoken/issues/36)) and the `from_tiktoken` pretokenizer/special-tokens rework ([#42](https://github.com/marcelroed/gigatoken/pull/42)).
