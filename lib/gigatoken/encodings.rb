@@ -9,12 +9,12 @@ module Gigatoken
     DATA_DIR = File.expand_path("encodings", __dir__)
     private_constant :DATA_DIR
 
-    # o200k_harmony's ten named control tokens, plus the six reserved slots
-    # sitting in the gaps between them (200000, 200001, 200004, 200009,
-    # 200010, 200011) — the non-contiguous head of openai_public.py's
-    # o200k_harmony() special-token table, transcribed verbatim (see
-    # PROVENANCE.md). Its reserved range only goes contiguous at 200013.
-    HARMONY_NAMED_TOKENS = {
+    # The non-contiguous head of openai_public.py's o200k_harmony()
+    # special-token table, transcribed verbatim (see PROVENANCE.md): its ten
+    # named control tokens, plus the six reserved slots sitting in the gaps
+    # between them (200000, 200001, 200004, 200009, 200010, 200011). The
+    # reserved range only goes contiguous at 200013.
+    HARMONY_HEAD_TOKENS = {
       "<|startoftext|>" => 199998,
       "<|endoftext|>" => 199999,
       "<|reserved_200000|>" => 200000,
@@ -32,13 +32,13 @@ module Gigatoken
       "<|call|>" => 200012,
       "<|endofprompt|>" => 200018
     }.freeze
-    private_constant :HARMONY_NAMED_TOKENS
+    private_constant :HARMONY_HEAD_TOKENS
 
-    # The contiguous tail of o200k_harmony's reserved range: 200013..201087.
-    # Combined with HARMONY_NAMED_TOKENS that's 1091 entries total (10
-    # named, 1081 reserved) — see PROVENANCE.md and AC4.
-    HARMONY_RESERVED_TOKENS = (200013..201087).to_h { |id| ["<|reserved_#{id}|>", id] }.freeze
-    private_constant :HARMONY_RESERVED_TOKENS
+    # The contiguous tail of that reserved range: 200013..201087. With the
+    # head above, 1091 entries total — 10 named, 1081 reserved (see
+    # PROVENANCE.md).
+    HARMONY_RESERVED_TAIL = (200013..201087).to_h { |id| ["<|reserved_#{id}|>", id] }.freeze
+    private_constant :HARMONY_RESERVED_TAIL
 
     REGISTRY = {
       "r50k_base" => {
@@ -65,7 +65,7 @@ module Gigatoken
       "o200k_harmony" => {
         rank_file: File.join(DATA_DIR, "o200k_base.tiktoken"),
         pretokenizer: "o200k",
-        special_tokens: HARMONY_NAMED_TOKENS.merge(HARMONY_RESERVED_TOKENS).freeze
+        special_tokens: HARMONY_HEAD_TOKENS.merge(HARMONY_RESERVED_TAIL).freeze
       }
     }.freeze
     private_constant :REGISTRY
