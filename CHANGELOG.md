@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.2.2] - 2026-09-08
+
+- **Fix a fatal crash when the extension is loaded on a thread that later
+  exits.** Under Falcon `--threaded`, the thread that runs `require
+  "gigatoken"` (an instance's loader thread) exits and is restarted; a later
+  thread that reused its `pthread_t` segfaulted inside `mi_thread_init` on the
+  next `Tokenizer#encode`, with `[BUG] Segmentation fault at 0x18`.
+
+  The cause is upstream: this crate's global allocator is mimalloc (see the
+  `XZM-WORKAROUND` comment in `ext/gigatoken/src/lib.rs`), and the `mimalloc`
+  crate's default line bundles mimalloc 3.3.2, which designates whichever
+  thread first initializes it as the process main thread and frees its static
+  main heap when that thread exits
+  ([microsoft/mimalloc#1287](https://github.com/microsoft/mimalloc/issues/1287)).
+  A later thread that inherits the recycled `pthread_t` is then judged "main"
+  and dereferences the freed heap. The upstream fix
+  ([microsoft/mimalloc@b92c116b67d0](https://github.com/microsoft/mimalloc/commit/b92c116b67d0))
+  isn't in any released `libmimalloc-sys` yet.
+
+  Fixed by switching the `mimalloc` crate to its `v2` feature, which bundles
+  mimalloc v2.3.2 — the last line before the affected redesign — whose static
+  main heap is never torn down. mimalloc itself stays: it's still the xzm
+  workaround.
+
+  Covered by a new example in `spec/gigatoken/concurrency_spec.rb`: build the
+  tokenizer inside a thread that then exits, then `encode` on it from 100
+  fresh threads.
+
 ## [0.2.1] - 2026-08-10
 
 - **Fix a fatal crash when one tokenizer is shared across threads.** Ruby hands

@@ -133,4 +133,25 @@ RSpec.describe "concurrent use of a shared tokenizer" do
     expect(out).to include("OK"), "subprocess died: #{out}"
     expect(status).to be_success
   end
+
+  # mimalloc#1287: the extension's global allocator (mimalloc) used to tear
+  # down its static main heap when the thread that first `require`d it exited,
+  # so a later thread reusing that pthread_t segfaulted in `mi_thread_init` on
+  # its first encode. Falcon `--threaded` hits this on instance restarts: the
+  # loader thread exits, and the next request thread crashes the interpreter.
+  it "survives encoding from fresh threads after the loading thread exits" do
+    status, out = run_ruby(<<~RUBY)
+      Warning[:experimental] = false
+      loader = Thread.new do
+        require "gigatoken"
+        Gigatoken::Tokenizer.from_encoding("o200k_base")
+      end
+      tok = loader.value
+      100.times { |i| Thread.new { tok.encode("hello again \#{i}") }.join }
+      puts "OK"
+    RUBY
+
+    expect(out).to include("OK"), "subprocess died: #{out}"
+    expect(status).to be_success
+  end
 end
