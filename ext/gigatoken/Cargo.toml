@@ -1,6 +1,6 @@
 [package]
 name = "gigatoken-rb"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 
 [lib]
@@ -13,7 +13,7 @@ crate-type = ["cdylib"]
 magnus = { version = "0.8", features = ["rb-sys"] }
 gigatoken = { path = "../..", default-features = false }
 rayon = "1.11"
-mimalloc = { version = "0.1", default-features = false }
+mimalloc = { version = "0.1", default-features = false, features = ["v2"] }
 # Same version requirement and feature set magnus-0.8.2 already puts on its
 # own rb-sys dependency (see magnus-0.8.2/Cargo.toml), so Cargo resolves both
 # to the one rb-sys already in Cargo.lock rather than a second copy.

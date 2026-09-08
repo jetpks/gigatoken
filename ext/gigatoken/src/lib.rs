@@ -5,6 +5,17 @@ use magnus::{Error, Module, RString, Ruby, Value, function};
 // XZM-WORKAROUND: macOS 26's xzm malloc zone SIGTRAPs on multi-GB Rust chunk
 // frees (`_xzm_reclaim_mark_used_locked` assertion); routing Rust allocations
 // through mimalloc avoids the xzm zone entirely.
+//
+// Pinned to the `v2` feature (bundled mimalloc v2.3.2, not the crate's
+// default v3.3.2): v3.3.x tears down its static main heap when the thread
+// that first loaded the extension exits, so a later thread that reuses that
+// pthread_t segfaults null-derefing `theap_main` in `mi_thread_init`
+// (upstream https://github.com/microsoft/mimalloc/issues/1287 — exactly the
+// "require on a thread, thread exits, another thread allocates" lifecycle
+// Falcon `--threaded` instance restarts produce). v2 never resets or frees
+// the static main heap, so it doesn't have this failure mode. Drop the
+// pin once a `libmimalloc-sys` release bundles mimalloc >= v3.4.1 (the fix
+// landed in microsoft/mimalloc@b92c116b67d0).
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
